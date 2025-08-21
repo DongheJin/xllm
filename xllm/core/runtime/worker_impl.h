@@ -5,10 +5,12 @@
 
 #include <memory>
 
+#include "common/device_monitor_async_wrapper.h"
 #include "common/types.h"
 #include "executor.h"
 #include "forward_params.h"
 #include "framework/context.h"
+#include "framework/eplb/eplb_executor.h"
 #include "framework/kv_cache/hccl_kv_cache_transfer.h"
 #include "framework/kv_cache/llm_data_dist_transfer.h"
 #include "framework/model/causal_lm.h"
@@ -135,9 +137,9 @@ class WorkerImpl {
 
   bool is_driver() const { return driver_ || dp_driver_; }
 
-  virtual int64_t get_active_activation_memory();
+  int64_t get_active_activation_memory();
 
-  virtual folly::SemiFuture<int64_t> get_active_activation_memory_async();
+  folly::SemiFuture<int64_t> get_active_activation_memory_async();
 
   Status get_status() const { return status_; }
 
@@ -177,6 +179,8 @@ class WorkerImpl {
 
   std::unique_ptr<Sampler> sampler_;
 
+  std::unique_ptr<EplbExecutor> eplb_executor_;
+
   // params for enable_schedule_overlap case
   // an output to store the result of last step
   ForwardOutput last_step_output_;
@@ -197,6 +201,10 @@ class WorkerImpl {
   bool is_spec_draft_ = false;
 
   Status status_ = Status::UNINITIALIZED;
+
+  DeviceMonitorAsyncWrapper device_monitor_;
+
+  torch::Tensor expert_load_data_;
 };
 
 }  // namespace xllm
