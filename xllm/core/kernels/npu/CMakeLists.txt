@@ -14,9 +14,4 @@ link_directories(
     $ENV{ATB_HOME_PATH}/lib
     $ENV{ASCEND_TOOLKIT_HOME}/lib64)
 
-if(USE_A3)
-    add_subdirectory(a3)
-else()
-    add_subdirectory(a2)
-endif()
 add_subdirectory(xllm_ops)

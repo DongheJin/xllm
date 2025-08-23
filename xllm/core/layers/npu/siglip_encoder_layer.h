@@ -1,11 +1,11 @@
 #pragma once
 #include <torch/torch.h>
 
-#include "atb_layers/pytorch/atb_torch/core/include/base_operation.h"
-#include "atb_layers/pytorch/atb_torch/core/include/graph_operation.h"
 #include "framework/context.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
+#include "xllm_kernels/pytorch/atb_torch/core/include/base_operation.h"
+#include "xllm_kernels/pytorch/atb_torch/core/include/graph_operation.h"
 
 namespace xllm::hf {
 

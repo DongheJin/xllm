@@ -14,16 +14,16 @@
 
 #include "atb/atb_infer.h"
 #include "atb_base.h"
-#include "atb_layers/core/include/atb_speed/base/hosttensor_binder.h"
-#include "atb_layers/core/include/atb_speed/base/model.h"
-#include "atb_layers/core/include/atb_speed/log.h"
-#include "atb_layers/core/include/atb_speed/utils/model_factory.h"
-#include "atb_layers/operations/fusion/linear/linear_parallel.h"
 #include "framework/context.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "nlohmann/json.hpp"
 #include "pytorch/adapter/utils/utils.h"
+#include "xllm_kernels/core/include/atb_speed/base/hosttensor_binder.h"
+#include "xllm_kernels/core/include/atb_speed/base/model.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
+#include "xllm_kernels/core/include/atb_speed/utils/model_factory.h"
+#include "xllm_kernels/operations/fusion/linear/linear_parallel.h"
 
 namespace xllm::hf {
 // Linear layer with column parallelism.

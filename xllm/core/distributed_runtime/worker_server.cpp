@@ -12,9 +12,6 @@
 #include <optional>
 #include <utility>
 
-#include "atb_layers/core/include/atb_speed/base/external_comm_manager.h"
-#include "atb_layers/core/include/atb_speed/utils/singleton.h"
-#include "atb_layers/models/base/param/mapping.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "framework/kv_cache/kv_cache.h"
@@ -28,6 +25,9 @@
 #include "util/net.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
+#include "xllm_kernels/core/include/atb_speed/base/external_comm_manager.h"
+#include "xllm_kernels/core/include/atb_speed/utils/singleton.h"
+#include "xllm_kernels/models/base/param/mapping.h"
 namespace xllm {
 
 void WorkerServer::create_server(const runtime::Options& options,

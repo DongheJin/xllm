@@ -2,10 +2,10 @@
 
 #include <glog/logging.h>
 
-#include "atb_layers/operations/aclnn/ops/repeat_operation.h"
-#include "atb_layers/operations/fusion/linear/linear.h"
-#include "atb_layers/operations/fusion/linear/linear_parallel.h"
-#include "atb_layers/operations/fusion/utils.h"
+#include "xllm_kernels/operations/aclnn/ops/repeat_operation.h"
+#include "xllm_kernels/operations/fusion/linear/linear.h"
+#include "xllm_kernels/operations/fusion/linear/linear_parallel.h"
+#include "xllm_kernels/operations/fusion/utils.h"
 
 namespace xllm::hf {
 std::shared_ptr<AtbLinearImpl> create_atb_linear_layer(const Context& context) {

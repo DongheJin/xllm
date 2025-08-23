@@ -8,9 +8,9 @@
 #include <typeinfo>
 #include <vector>
 
-#include "atb_layers/core/include/atb_speed/log.h"
 #include "core/layers/npu/attn_mask.h"
 #include "core/layers/npu/rms_norm.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
 // test
 #include <mstx/ms_tools_ext.h>
 

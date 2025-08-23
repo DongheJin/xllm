@@ -102,6 +102,10 @@ def set_npu_envs():
     if not PYTORCH_NPU_INSTALL_PATH:
         os.environ["PYTORCH_NPU_INSTALL_PATH"] = "/usr/local/libtorch_npu"
 
+    XLLM_KERNELS_PATH = os.getenv("XLLM_KERNELS_PATH")
+    if not XLLM_KERNELS_PATH:
+        os.environ["XLLM_KERNELS_PATH"] = "/usr/local/xllm_kernels"
+
     os.environ["PYTHON_INCLUDE_PATH"] = get_python_include_path()
     os.environ["PYTHON_LIB_PATH"] =  get_torch_root_path()
     os.environ["LIBTORCH_ROOT"] = get_torch_root_path()
@@ -141,6 +145,8 @@ def set_npu_envs():
     if not ATB_PATH:
         os.environ["ATB_PATH"] = "/usr/local/Ascend/nnal/atb"
         ATB_PATH = "/usr/local/Ascend/nnal/atb"
+
+
     ATB_HOME_PATH = ATB_PATH+"/latest/atb/cxx_abi_"+str(get_cxx_abi())
     LD_LIBRARY_PATH = os.getenv("LD_LIBRARY_PATH", "")
     LD_LIBRARY_PATH = ATB_HOME_PATH+"/lib" + ":" + \
@@ -193,18 +199,27 @@ class ExtBuild(build_ext):
     user_options = build_ext.user_options + [
         ("base-dir=", None, "base directory of xLLM project"),
         ("device=", None, "target device type (a3 or a2)"),
+        ("arch=", None, "target arch type (x86 or arm)"),
     ]
 
     def initialize_options(self):
         build_ext.initialize_options(self)
         self.base_dir = get_base_dir()
         self.device = "a2"  
+        self.arch = "x86"
 
     def finalize_options(self):
         build_ext.finalize_options(self)
         self.device = self.device.lower()
+        if self.device is None:
+          self.device = "a2"
         if self.device not in ("a2", "a3"):
             raise ValueError("--device must be either 'a2' or 'a3' (case-insensitive)")
+        if self.arch is None:
+          self.arch = "x86"
+        self.arch = self.arch.lower()
+        if self.arch not in ("x86", "arm"):
+            raise ValueError("--arch must be either 'x86' or 'arm' (case-insensitive)")
 
     def run(self):
         # check if cmake is installed
@@ -253,6 +268,7 @@ class ExtBuild(build_ext):
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DBUILD_SHARED_LIBS=OFF",
             f"-DDEVICE_TYPE=USE_{self.device.upper()}",
+            f"-DDEVICE_ARCH={self.arch.upper()}",
         ]
 
         # set npu environment variables
@@ -376,6 +392,7 @@ def check_and_install_pre_commit():
 
 if __name__ == "__main__":
     device = 'a2'  # default
+    arch = "x86" # default
     if '--device' in sys.argv:
         idx = sys.argv.index('--device')
         if idx + 1 < len(sys.argv):
@@ -386,6 +403,17 @@ if __name__ == "__main__":
             # Remove the arguments so setup() doesn't see them
             del sys.argv[idx]
             del sys.argv[idx]
+    if '--arch' in sys.argv:
+        idx = sys.argv.index('--arch')
+        if idx + 1 < len(sys.argv):
+            arch = sys.argv[idx+1].lower()
+            if arch not in ('x86', 'arm'):
+                print("Error: --arch must be x86 or arm")
+                sys.exit(1)
+            # Remove the arguments so setup() doesn't see them
+            del sys.argv[idx]
+            del sys.argv[idx]
+
     version = get_version()
 
     # check and install git pre-commit
@@ -425,7 +453,7 @@ if __name__ == "__main__":
         cmdclass={"build_ext": ExtBuild,
                   "test": TestUT,
                   'bdist_wheel': BuildDistWheel},
-        options={'build_ext': {'device': device}},
+        options={'build_ext': {'device': device,'arch': arch}},
         zip_safe=False,
         py_modules=["xllm/launch_xllm", "xllm/__init__",
                     "xllm/pybind/llm", "xllm/pybind/args"],

@@ -6,7 +6,6 @@
 
 #include <unordered_map>
 
-#include "atb_layers/core/include/atb_speed/log.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/layers/npu/llm_head.h"
@@ -17,6 +16,7 @@
 #include "processors/input_processor.h"
 #include "processors/qwen2_vl_image_processor.h"
 #include "qwen2.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
 
 namespace xllm::hf {
 

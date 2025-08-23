@@ -8,10 +8,10 @@
 #include <optional>
 #include <vector>
 
-#include "atb_layers/models/base/param/mapping.h"
 #include "core/common/macros.h"
 #include "hccl/hccl.h"
 #include "mapping_npu.h"
+#include "xllm_kernels/models/base/param/mapping.h"
 
 namespace xllm {
 

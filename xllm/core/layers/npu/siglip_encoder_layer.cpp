@@ -1,7 +1,7 @@
 #include "siglip_encoder_layer.h"
 
-#include "atb_layers/pytorch/atb_torch/core/include/base_operation.h"
 #include "nlohmann/json.hpp"
+#include "xllm_kernels/pytorch/atb_torch/core/include/base_operation.h"
 
 namespace xllm::hf {
 

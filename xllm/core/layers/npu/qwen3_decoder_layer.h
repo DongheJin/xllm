@@ -13,11 +13,6 @@
 
 #include "atb/atb_infer.h"
 #include "atb_base.h"
-#include "atb_layers/core/include/atb_speed/base/hosttensor_binder.h"
-#include "atb_layers/core/include/atb_speed/base/model.h"
-#include "atb_layers/core/include/atb_speed/log.h"
-#include "atb_layers/core/include/atb_speed/utils/model_factory.h"
-#include "atb_layers/models/qwen3/layer/decoder_layer.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -26,6 +21,11 @@
 #include "framework/state_dict/state_dict.h"
 #include "nlohmann/json.hpp"
 #include "pytorch/adapter/utils/utils.h"
+#include "xllm_kernels/core/include/atb_speed/base/hosttensor_binder.h"
+#include "xllm_kernels/core/include/atb_speed/base/model.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
+#include "xllm_kernels/core/include/atb_speed/utils/model_factory.h"
+#include "xllm_kernels/models/qwen3/layer/decoder_layer.h"
 
 namespace xllm::hf {
 

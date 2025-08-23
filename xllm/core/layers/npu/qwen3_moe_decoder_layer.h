@@ -7,12 +7,12 @@
 #include <nlohmann/json.hpp>
 
 #include "atb_base.h"
-#include "atb_layers/models/qwen3/layer/moe_decoder_layer.h"
 #include "framework/model/model_args.h"
 #include "framework/model/npu_dp_ep_padding.h"
 #include "framework/parallel_state.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
+#include "xllm_kernels/models/qwen3/layer/moe_decoder_layer.h"
 
 namespace xllm::hf {
 

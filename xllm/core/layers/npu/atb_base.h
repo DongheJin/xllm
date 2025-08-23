@@ -13,10 +13,6 @@
 #include <vector>
 
 #include "atb/atb_infer.h"
-#include "atb_layers/core/include/atb_speed/base/model.h"
-#include "atb_layers/core/include/atb_speed/log.h"
-#include "atb_layers/core/include/atb_speed/utils/singleton.h"
-#include "atb_layers/core/include/atb_speed/utils/tensor_util.h"
 #include "buffer/atb_workspace.h"
 #include "framework/context.h"
 #include "framework/kv_cache/kv_cache.h"
@@ -24,6 +20,10 @@
 #include "framework/state_dict/state_dict.h"
 #include "pytorch/adapter/utils/utils.h"
 #include "pytorch/adapter/workspace/workspace.h"
+#include "xllm_kernels/core/include/atb_speed/base/model.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
+#include "xllm_kernels/core/include/atb_speed/utils/singleton.h"
+#include "xllm_kernels/core/include/atb_speed/utils/tensor_util.h"
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 #include <torch_npu/csrc/framework/OpCommand.h>

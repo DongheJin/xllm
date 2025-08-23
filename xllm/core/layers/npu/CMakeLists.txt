@@ -8,7 +8,6 @@ cc_library(
   HDRS
     llama_decoder_layer.h
     qwen2_decoder_layer.h
-    qwen2_5_vision_encoder_layer.h
     qwen3_decoder_layer.h
     qwen3_moe_decoder_layer.h
     attn_mask.h
@@ -21,6 +20,7 @@ cc_library(
     atb_head_impl.h
     siglip_encoder_layer.h
     multi_head_attention.h
+    $<$<BOOL:${USE_A2}>:qwen2_5_vision_encoder_layer.h>
     $<$<BOOL:${USE_A2}>:qwen3_moe_decoder_layer.h>
     atb_linear.h
     atb_parallel_linear.h
@@ -29,8 +29,8 @@ cc_library(
   SRCS
     llama_decoder_layer.cpp
     qwen2_decoder_layer.cpp
-    qwen2_5_vision_encoder_layer.cpp
     qwen3_decoder_layer.cpp
+    $<$<BOOL:${USE_A2}>:qwen2_5_vision_encoder_layer.cpp>
     $<$<BOOL:${USE_A2}>:qwen3_moe_decoder_layer.cpp>
     attn_mask.cpp
     atb_base.cpp
@@ -48,12 +48,7 @@ cc_library(
     buffer/atb_buffer.cpp
     buffer/atb_workspace.cpp
   DEPS
-    :atb_speed_operations
-    :atb_speed_core
-    :atb_speed_models
-    :atb_speed_torch
     "-Wl,--whole-archive"
-    :atb_torch
     "-Wl,--no-whole-archive"
     :kv_cache
     :prefix_cache
@@ -65,6 +60,7 @@ cc_library(
     spdlog::spdlog
     torch
     torch_npu
+    xllm_kernels
 )
 
 

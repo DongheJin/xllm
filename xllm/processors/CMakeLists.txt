@@ -14,8 +14,9 @@ set(BASE_DEPS
 )
 
 # Check if NPU is being used
-include_directories(${CMAKE_SOURCE_DIR}/src/kernels/ascend/core/include)
-include_directories(${CMAKE_SOURCE_DIR}/src/kernels/ascend)
+include_directories($ENV{XLLM_KERNELS_PATH}/include/xllm_kernels/core/include) 
+include_directories($ENV{XLLM_KERNELS_PATH}/include/xllm_kernels)
+
 # Modify dependencies for NPU
 list(APPEND BASE_DEPS torch_npu)
 list(APPEND BASE_DEPS :npu_layers)
@@ -40,4 +41,3 @@ cc_library(
   DEPS
     ${BASE_DEPS}
 )
-

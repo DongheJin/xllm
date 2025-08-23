@@ -1065,13 +1065,27 @@ void DeepseekV2DecoderImpl::merge_experts_weights() {
                               experts_weights_["up_proj.weight_scale"]);
   }
 
+#if defined(USE_A3)
   torch::Tensor mlp_down_weight =
       merge_experts_weights(experts_weights_["down_proj.weight"],
-                            /*transpose=*/true);
+                            /*transpose=*/false);
   at_weight_tensors_[IN_MLP_DOWN_WEIGHT_EXPERT] =
-      at_npu::native::npu_format_cast(mlp_down_weight, 29);
-  // at_weight_tensors_[IN_MLP_DOWN_WEIGHT_EXPERT] =
-  //     at_npu::native::npu_format_cast(mlp_down_weight, 2).contiguous();
+      at_npu::native::npu_format_cast(mlp_down_weight, 2).contiguous();
+#else
+  if (decode_param_.isBF16) {
+    torch::Tensor mlp_down_weight =
+        merge_experts_weights(experts_weights_["down_proj.weight"],
+                              /*transpose=*/true);
+    at_weight_tensors_[IN_MLP_DOWN_WEIGHT_EXPERT] =
+        at_npu::native::npu_format_cast(mlp_down_weight, 29);
+  } else {
+    torch::Tensor mlp_down_weight =
+        merge_experts_weights(experts_weights_["down_proj.weight"],
+                              /*transpose=*/false);
+    at_weight_tensors_[IN_MLP_DOWN_WEIGHT_EXPERT] =
+        at_npu::native::npu_format_cast(mlp_down_weight, 2).contiguous();
+  }
+#endif
   if (quantize_type_ == "w8a8_dynamic") {
     at_weight_tensors_[IN_MLP_DOWN_OFFSET_EXPERT] =
         merge_experts_weights(experts_weights_["down_proj.weight_offset"]);

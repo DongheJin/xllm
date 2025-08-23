@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.26)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
+if(DEVICE_ARCH STREQUAL "ARM")
+    set(CMAKE_SYSTEM_PROCESSOR aarch64)
+    set(RUST_TARGET aarch64-unknown-linux-gnu)
+endif()
+
 if(DEVICE_TYPE STREQUAL "USE_A3")
     add_compile_definitions(USE_A3) 
     add_definitions(-DUSE_A3)
     set(USE_A3 ON)
-    set(CMAKE_SYSTEM_PROCESSOR aarch64)
-    set(RUST_TARGET aarch64-unknown-linux-gnu)
     message(STATUS "Building for device: A3 (macro USE_A3 defined)")
 else()
     add_compile_definitions(USE_A2)
@@ -265,6 +268,9 @@ include_directories(
     $ENV{ASCEND_HOME_PATH}/include
     $ENV{ATB_HOME_PATH}/include
     $ENV{ASCEND_HOME_PATH}/opp/vendors/xllm/op_api/include/
+    $ENV{XLLM_KERNELS_PATH}/include/xllm_kernels/core/include
+    $ENV{XLLM_KERNELS_PATH}/include/xllm_kernels
+    $ENV{XLLM_KERNELS_PATH}/include/
 )
 
 link_directories(
@@ -275,6 +281,7 @@ link_directories(
     $ENV{ATB_HOME_PATH}/lib
     $ENV{ASCEND_TOOLKIT_HOME}/lib64
     $ENV{ASCEND_HOME_PATH}/opp/vendors/xllm/op_api/lib/
+    $ENV{XLLM_KERNELS_PATH}/lib/
 )
 link_libraries(cust_opapi)
 # check if USE_CXX11_ABI is set correctly

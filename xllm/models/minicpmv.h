@@ -7,7 +7,6 @@
 #include <regex>
 #include <unordered_map>
 
-#include "atb_layers/core/include/atb_speed/log.h"
 #include "core/framework/context.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
@@ -18,6 +17,7 @@
 #include "processors/minicpmv_image_processor.h"
 #include "processors/pywarpper_image_processor.h"
 #include "qwen2.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
 
 namespace xllm::hf {
 

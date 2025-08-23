@@ -5,7 +5,6 @@
 #include <mstx/ms_tools_ext.h>
 #include <torch/torch.h>
 
-#include "atb_layers/core/include/atb_speed/log.h"
 #include "core/common/global_flags.h"
 #include "core/framework/context.h"
 #include "core/framework/kv_cache/kv_cache.h"
@@ -19,6 +18,7 @@
 #include "core/layers/npu/word_embedding.h"
 #include "core/util/tensor_helper.h"
 #include "model_registry.h"
+#include "xllm_kernels/core/include/atb_speed/log.h"
 
 // llama2 model compatible with huggingface weights
 namespace xllm::hf {

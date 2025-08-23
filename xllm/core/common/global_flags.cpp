@@ -166,10 +166,6 @@ DEFINE_int32(sleep_time_second,
 
 DEFINE_bool(disable_custom_kernels, false, "disable all custom kernels");
 
-DEFINE_bool(enable_atb_comm_multiprocess,
-            false,
-            "whether to use multiprocess mode.");
-
 // --- function call config ---
 
 DEFINE_string(tool_call_parser,
