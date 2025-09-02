@@ -438,6 +438,20 @@ void DeepseekV2DecoderImpl::initialize_basic_parameters(
   param.maskfree = true;                            // TODO
   param.enableSwiGLUQuantForSharedExperts = false;  // TODO
 
+  // param.enablePrefixCache = 0;
+  // param.enableFusedMLA = 0;
+  // param.enableMlaPrefetch = 0;
+  param.scaledTopk = -1;
+  // param.enableInitRoutingCutoff = 0;
+  // param.numDanglingSharedExperts = 0;
+  param.enableATBGateMatmul = 1;
+  param.enableDispatchCombineV2 = 0;
+  // param.enableOutLcocTp = 0;
+  // param.enablePreprocessLcocTp = 0;
+  // param.enableLcocAll2All = 1;
+  // param.mixSharedRouting = 0;
+  // param.enableAtlasGMMFused = 0;
+
   num_key_value_heads_ = static_cast<int>(args.n_kv_heads().value());
   qk_nope_head_dim_ = args.qk_nope_head_dim();
   v_head_dim_ = args.v_head_dim();
@@ -1193,6 +1207,7 @@ void DeepseekV2DecoderImpl::merge_experts_weights() {
 #if defined(USE_A3)
   torch::Tensor mlp_down_weight =
       merge_experts_weights(experts_weights_["down_proj.weight"],
+                            device_,
                             /*transpose=*/false);
   at_weight_tensors_[IN_MLP_DOWN_WEIGHT_EXPERT] =
       at_npu::native::npu_format_cast(mlp_down_weight, 2).contiguous();
