@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/runtime/mtp_async_input_builder.h"
 #include "core/runtime/mtp_async_state.h"
+#include "core/runtime/mtp_token_consensus.h"
 #include "spec_input_builder.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
@@ -46,29 +47,6 @@ namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
-
-void broadcast_spec_tokens(torch::Tensor& tokens,
-                           const ParallelArgs& parallel_args,
-                           int32_t root_rank = 0) {
-  if (!tokens.defined()) {
-    return;
-  }
-  tokens = tokens.contiguous();
-  ProcessGroup* tp_group = parallel_args.tp_group_ != nullptr
-                               ? parallel_args.tp_group_
-                               : parallel_args.process_group_;
-  if (tp_group != nullptr && tp_group->world_size() > 1) {
-    tp_group->broadcast(tokens, root_rank);
-  }
-
-  // With orthogonal TP x CP, TP first propagates the root token within CP0,
-  // then each CP group propagates that same value to its matching TP rank.
-  ProcessGroup* cp_group = parallel_args.cp_group_;
-  if (cp_group != nullptr && cp_group != tp_group &&
-      cp_group->world_size() > 1) {
-    cp_group->broadcast(tokens, root_rank);
-  }
-}
 
 int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
   const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
@@ -896,6 +874,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
       run_llm_no_sync_impl(
           *impl_, input, *prepare_stream_, *compute_stream_, target_prepared)
           .value();
+  {
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    broadcast_mtp_tokens(output.sample_output.next_tokens, parallel_args_);
+  }
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
@@ -1254,7 +1236,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       if (get_optimization_config().enable_spec_token_broadcast &&
           !current_draft_input.sampling_params.all_greedy_sample) {
         SampleOutput& draft_sample = draft_outputs.back().sample_output;
-        broadcast_spec_tokens(draft_sample.next_tokens, parallel_args_);
+        broadcast_mtp_tokens(draft_sample.next_tokens, parallel_args_);
       }
       process_draft_sample_output(draft_outputs.back().sample_output);
     }
@@ -1381,7 +1363,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
     // deriving any device-resident state used by the next draft iteration.
     if (get_optimization_config().enable_spec_token_broadcast &&
         !input.sampling_params.all_greedy_sample) {
-      broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
+      broadcast_mtp_tokens(val_output.next_tokens, parallel_args_);
     }
 
     base_positions = validate_input.positions.view({batch_size, num_val_tokens})

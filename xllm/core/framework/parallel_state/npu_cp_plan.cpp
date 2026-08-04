@@ -1165,7 +1165,12 @@ std::vector<torch::Tensor> CpRowLayout::gather_global_rows_bundle(
 
   torch::Tensor local_bundle = torch::cat(tensors, /*dim=*/1);
   torch::Tensor global_bundle = gather_global_rows(local_bundle, cp_group);
-  return global_bundle.split_with_sizes(widths, /*dim=*/1);
+  std::vector<torch::Tensor> global_tensors =
+      global_bundle.split_with_sizes(widths, /*dim=*/1);
+  for (torch::Tensor& tensor : global_tensors) {
+    tensor = tensor.contiguous();
+  }
+  return global_tensors;
 }
 
 // Extracts the global-real CpPlanInput from a ForwardInput: positions and

@@ -257,9 +257,6 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
                         : semantic_window;
   const int64_t swa_blocks_per_seq =
       get_swa_blocks_per_seq(window_size, block_size);
-  const int64_t burst_blocks = util::ceil_div(
-      std::max(options.max_tokens_per_batch, static_cast<int64_t>(1)),
-      block_size);
   const int64_t head_dim = model_args.head_dim();
   const int64_t index_head_dim =
       std::max<int64_t>(model_args.index_head_dim(), 1);
@@ -269,8 +266,11 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
       static_cast<int64_t>(torch::elementSize(options.dtype));
 
   Dsv4KVCacheEstimateCost cache_cost;
-  cache_cost.swa_count =
-      swa_blocks_per_seq * max_seqs + burst_blocks + max_seqs + 2;
+  cache_cost.swa_count = get_swa_pool_num_blocks(
+      swa_blocks_per_seq,
+      max_seqs,
+      std::max(options.max_tokens_per_batch, static_cast<int64_t>(1)),
+      block_size);
   for (int64_t i = 0; i < model_args.n_layers(); ++i) {
     const int32_t ratio = i < static_cast<int64_t>(compress_ratios.size())
                               ? compress_ratios[static_cast<size_t>(i)]

@@ -35,6 +35,7 @@ cc_library(
     xservice_client.h
     speculative_worker_impl.h
     mtp_async_input_builder.h
+    mtp_token_consensus.h
     mtp_worker_impl.h
     mtp_async_state.h
     suffix_worker_impl.h
@@ -72,6 +73,7 @@ cc_library(
     params_utils.cpp
     speculative_worker_impl.cpp
     mtp_async_input_builder.cpp
+    mtp_token_consensus.cpp
     mtp_worker_impl.cpp
     mtp_async_state.cpp
     suffix_worker_impl.cpp

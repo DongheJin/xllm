@@ -1072,7 +1072,9 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
           /*cu_seqlens_q=*/as_optional(half_metadata.q_cu_seq_lens),
           /*cu_seqlens_ori_kv=*/std::nullopt,
           /*cu_seqlens_cmp_kv=*/std::nullopt,
-          /*seqused_q=*/as_optional(half_metadata.q_seq_lens),
+          // TND query lengths are described by cu_seqlens_q. The current
+          // SparseAttnSharedkv kernel rejects a non-null seqused_q input.
+          /*seqused_q=*/std::nullopt,
           /*seqused_kv=*/as_optional(half_metadata.kv_seq_lens),
           /*sinks=*/attn_sink_loaded_ ? as_optional(attn_sink_) : std::nullopt,
           /*metadata=*/as_optional(local_sparse_metadata),

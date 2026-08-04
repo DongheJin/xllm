@@ -31,8 +31,9 @@ Query、causal KV endpoint 和 sparse/QLI metadata。
 
 ## 2. 设计状态和代码基线
 
-- 文档状态：V2 设计已冻结；Task 0-8 的代码、标准 NPU 构建和聚焦单测已完成，
-  Task 9 的 8 卡端到端、性能和稳定性验证待设备空闲后执行。
+- 文档状态：V2 设计已冻结；Task 0-8 的代码、标准 NPU 构建和聚焦单测已完成，Task 9
+  的首版 8 卡正确性、SHM、有界稳定性和长输入性能门禁已完成。完整正交拓扑矩阵、
+  msprof 分层数据和长时间 soak 作为发布扩展验证继续执行。
 - 代码基线：`upstream/main`，提交 `e69351b4`。
 - 目标后端：NPU Torch。
 - 目标模型：`deepseek_v4`、`deepseek_v4_mtp`。
@@ -1032,7 +1033,7 @@ persistent buffer 在 free-memory 快照前 warmup，tensor 临时量由 allocat
 ### Task 3：DSV4 CP Metadata
 
 状态：已完成。front/back pack、destination、active sequence、local q/kv 长度和 endpoint
-已通过 `Dsv4CpMetadataBuilderTest` 4 项单测；ratio-specific sparse/QLI metadata 已接入
+已通过 `Dsv4CpMetadataBuilderTest` 5 项单测；ratio-specific sparse/QLI metadata 已接入
 DSV4 attention 运行时。
 
 实现 front/back pack/scatter、endpoint 和 ratio-specific metadata builder。
@@ -1117,8 +1118,8 @@ cache/output 对比归入 Task 9。
 状态：代码接入完成。Target/draft 按 value-semantic layout signature 对齐，model boundary
 恢复 global output，MTP token 共识和 bootstrap state 已接入；`NpuCpPlanTest` 中 MTP/layout
 用例、`MtpPrepareNextDraftTest` 2 项、`MtpAsyncStateTest` 5 项和
-`SequenceMtpBootstrapTest` 1 项通过。CP 下 `enable_mtp_draft_body_tp1=true` 会在启动时
-因 target/draft CP 拓扑不一致而被拒绝。
+`SequenceMtpBootstrapTest` 1 项、`MtpTokenConsensusTest` 4 项通过。CP 下
+`enable_mtp_draft_body_tp1=true` 会在启动时因 target/draft CP 拓扑不一致而被拒绝。
 
 接入 model boundary merge、aux hidden 和 MTP layout signature。
 
@@ -1135,13 +1136,26 @@ cache/output 对比归入 Task 9。
 
 ### Task 9：DP、Graph 和端到端验证
 
-状态：待执行。代码中已显式关闭 CP-active prefill 的 effective graph flag，pure decode
-仍保留原 graph-eligible 路径；截至 2026-08-04，本机 16 个 NPU 芯片均被现有
-`VLLMWorker_DP` 占用，未干扰这些进程，因此尚未执行 8 卡 DSV4 full/chunked/prefix/MTP/
-decode-graph 端到端矩阵。
+状态：首版门禁已完成。代码中已显式关闭 CP-active prefill 的 effective graph flag，pure decode
+仍保留原 graph-eligible 路径。已通过 CP=1 baseline、CP=8 eager 1K/8K、4 并发、4K
+chunked prefill、1K prefix、20K chunked+prefix（第二次请求命中 16384 cached tokens）、
+MTP=3 单请求/2 并发，以及前三种 MoE 组合。graph 开启时 CP prefill 成功，随后 8 个 rank
+均完成 8/4/2/1 token pure-decode ACL Graph bucket capture。
+
+EP2 fused MC2 验证已定位并修复 Python forkserver 的 `LD_PRELOAD` 信号继承问题，以及
+`DispatchFFNCombine` wrapper 缺失 `xActiveMask` 导致 group 指针被错当 `aclTensor*` 的
+ABI 参数错位。修复后 CP8 单请求与 MC2=0 的输出、结束原因和 token usage 完全一致，
+双并发通过；打开 SHM 后继续通过双并发及 25 轮、每轮 4 并发共 100 条请求，8 个 rank
+全程存活，轮耗时中位数为 1.338 秒、最大值为 1.543 秒。
+
+长输入性能固定后 8 卡、20 GiB KV cap、chunked prefill、EP2 和 MC2=0，CP1/CP8 各执行
+5 轮。约 7.5K token 输入的中位端到端耗时为 1.098/0.959 秒，CP8 降低 12.7%；约
+29.8K token 输入为 3.195/2.486 秒，CP8 降低 22.2%；所有输出一致。MC2=0 用于规避
+现有 fused MC2 对 CP1 全局长 rows 的独立 tiling 限制，保证该组只比较 CP 差异。
 
 先完成第一阶段 `dp=1,cp=8,tp=1,ep=8` 的 1K/8K/32K、MTP 和 decode graph 门禁；
-通过后再扩展到下列正交矩阵。未完成扩展矩阵前，对外 capability 只能接受第一阶段拓扑。
+该阶段已完成。下列正交矩阵、msprof 分层数据和长时间 soak 作为发布扩展验证继续执行；
+未完成扩展矩阵前，对外 capability 只能接受第一阶段拓扑。
 
 测试矩阵：
 

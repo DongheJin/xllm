@@ -6,8 +6,9 @@ sidebar:
 
 ## 1. 文档状态
 
-- 状态：Task 0-8 的实现、标准 NPU 构建和聚焦单测已完成；Task 9 的 8 卡端到端、性能和
-  稳定性验证待设备空闲后执行。
+- 状态：Task 0-8 的实现、标准 NPU 构建和聚焦单测已完成；Task 9 的首版 8 卡正确性、
+  SHM、有界稳定性和长输入性能门禁已完成。完整正交拓扑矩阵、msprof 分层数据和长时间
+  soak 作为发布扩展验证继续执行。
 - 上层方案：`deepseek_v4_npu_cp_pre_compressor_v2.md`。
 - 代码基线：`upstream/main`，提交 `e69351b4`。
 - 目标后端：NPU Torch，A3。
@@ -786,7 +787,7 @@ dsv4_cp_prefill_eager_fallbacks
   worker 在 KV capacity 估算前 warmup CP communicator、预留 CP transient，并将剩余容量
   交给 KV estimator。`Dsv4CpExecutionContext` 不持有跨层 tensor。
 - [x] P1.1：DSV4 front/back metadata 和 C1 attention。
-  验证：`Dsv4CpMetadataBuilderTest` 4 项通过，C1 local Query/global SWA 路径完成编译；
+  验证：`Dsv4CpMetadataBuilderTest` 5 项通过，C1 local Query/global SWA 路径完成编译；
   模型级结果对比归入 P1.6。
 - [x] P1.2：C128 main compressor。
   验证：local projection/global gather/split core/cache write 路径完成编译；C128 split
@@ -800,10 +801,34 @@ dsv4_cp_prefill_eager_fallbacks
 - [x] P1.5：Target boundary、MTP prefill。
   验证：target/draft value-semantic layout、global output merge、token 共识和 bootstrap 已
   接入；`MtpPrepareNextDraftTest` 2 项、`MtpAsyncStateTest` 5 项、
-  `SequenceMtpBootstrapTest` 1 项及 `NpuCpPlanTest` 中 MTP/layout 用例通过。
-- [ ] P1.6：8 卡端到端、性能和长期稳定性验证。
-  当前：截至 2026-08-04，本机 16 个 NPU 芯片均被现有 `VLLMWorker_DP` 占用；未终止或
-  干扰这些进程，因此尚未执行 DSV4 full/chunked/prefix/MTP/decode-graph 端到端矩阵。
+  `SequenceMtpBootstrapTest` 1 项、`MtpTokenConsensusTest` 4 项及 `NpuCpPlanTest` 中
+  MTP/layout 用例通过。
+- [x] P1.6：首版 8 卡端到端、性能和有界稳定性验证。
+  8 卡正确性门禁：
+  - CP=1 baseline 与 CP=8 eager 的 1K 输入结果一致；CP=8 的 8K 和 4 并发请求通过；
+  - graph 开启时 CP prefill 成功，随后 8 个 rank 的 pure decode 均完成 8/4/2/1 token
+    ACL Graph bucket capture；
+  - 4K chunked prefill、1K prefix reuse 和 20K chunked+prefix 通过，20K 第二次请求命中
+    16384 个 cached tokens；
+  - MTP=3 的单请求和 2 并发通过；
+  - `expert_parallel_degree=1, enable_fused_mc2={0,1}` 以及
+    `expert_parallel_degree=2, enable_fused_mc2={0,1}` 四种组合均通过；EP2 fused MC2 的
+    512-token 单请求输出、结束原因和 token usage 与 MC2=0 完全一致；
+  - `enable_shm=true`、EP2 fused MC2 下双并发通过；随后 25 轮、每轮 4 并发共 100 条
+    请求全部成功，8 个 rank 全程存活，轮耗时中位数为 1.338 秒、最大值为 1.543 秒。
+  已在验证中修复 SWA 双 chunk 峰值容量、压缩输出尾部 padding slot、bundle split
+  contiguous、SHM 反序列化残留 block table 和 MTP 跨 CP token 共识问题。EP2 fused MC2
+  进一步修复了 Python forkserver 的 `LD_PRELOAD` 信号继承问题和
+  `DispatchFFNCombine` 缺失 `xActiveMask` 导致的 ABI 参数错位。
+
+  长输入性能使用后 8 卡、`max_memory_utilization=0.95`、20 GiB KV cap、chunked prefill、
+  `expert_parallel_degree=2` 和 `enable_fused_mc2=0`，CP1/CP8 各执行 5 轮。约 7.5K token
+  输入的中位端到端耗时为 1.098/0.959 秒，CP8 降低 12.7%；约 29.8K token 输入为
+  3.195/2.486 秒，CP8 降低 22.2%；所有输出均一致。MC2=0 用于规避现有 fused MC2 对
+  CP1 全局长 rows 的独立 tiling 限制，确保该组只比较 CP 差异。
+
+  完整 `DP x CP x TP` 正交矩阵、msprof 层级拆分和更长时间 soak 不属于当前首版 capability
+  的合入门禁，保留为发布扩展验证；首版 capability 仍只接受本文定义的固定拓扑。
 
 实现过程中每完成一项，就在本文更新状态，并在同一项下记录测试命令和结果摘要。
 

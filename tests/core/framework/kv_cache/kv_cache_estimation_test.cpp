@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <vector>
 
+#include "framework/block/block_utils.h"
 #include "framework/model/model_args.h"
 
 namespace xllm {
@@ -316,7 +317,13 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
 
   KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
 
-  EXPECT_EQ(capacity.swa_count(), 19);
+  const int64_t expected_swa_count = get_swa_pool_num_blocks(
+      get_swa_blocks_per_seq(model_args.window_size(), options.block_size),
+      options.max_seqs_per_batch,
+      /*max_tokens_per_batch=*/1,
+      options.block_size);
+  EXPECT_EQ(expected_swa_count, 20);
+  EXPECT_EQ(capacity.swa_count(), expected_swa_count);
 #if defined(USE_MLU)
   EXPECT_EQ(capacity.c4_count(), 64);
   EXPECT_EQ(capacity.c128_count(), 2);

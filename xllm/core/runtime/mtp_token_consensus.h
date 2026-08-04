@@ -15,15 +15,16 @@ limitations under the License.
 
 #pragma once
 
-#include <cstdint>
+#include <torch/torch.h>
 
 namespace xllm {
 
-int64_t get_swa_blocks_per_seq(int64_t window_size, int64_t block_size);
+struct ParallelArgs;
 
-int64_t get_swa_pool_num_blocks(int64_t swa_blocks_per_seq,
-                                int64_t max_seqs,
-                                int64_t max_tokens_per_batch,
-                                int64_t block_size);
+// Propagate the authoritative sampled token through orthogonal TP and CP
+// groups before another MTP stage consumes it.
+void broadcast_mtp_tokens(torch::Tensor& tokens,
+                          const ParallelArgs& parallel_args,
+                          int32_t root_rank = 0);
 
 }  // namespace xllm

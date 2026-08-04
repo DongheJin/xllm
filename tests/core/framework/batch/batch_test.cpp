@@ -1125,6 +1125,10 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
   input.input_params.embedding.mtp_bootstrap_embeddings =
       torch::tensor({{3.0f, 4.0f}});
+  input.input_params.multi_block_tables = {
+      torch::tensor({{11, 12}}, torch::kInt32),
+      torch::tensor({{21, 22}}, torch::kInt32),
+      torch::tensor({{31, 32}}, torch::kInt32)};
   bool is_creator = false;
   auto shm_name =
       ForwardSharedMemoryManager::create_unique_name("batch_test_forward_input",
@@ -1140,6 +1144,10 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   ASSERT_TRUE(writer_manager.input_write(input));
 
   ForwardInput round_trip;
+  round_trip.input_params.multi_block_tables = {
+      torch::tensor({{-1}}, torch::kInt32),
+      torch::tensor({{-2}}, torch::kInt32),
+      torch::tensor({{-3}}, torch::kInt32)};
   reader_manager.input_read(round_trip, torch::Device(torch::kCPU));
 
   EXPECT_EQ(round_trip.input_params.meta.batch_id, batch_id);
@@ -1157,6 +1165,13 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       round_trip.input_params.embedding.mtp_bootstrap_embeddings.to(
           torch::kCPU),
       torch::tensor({{3.0f, 4.0f}})));
+  ASSERT_EQ(round_trip.input_params.multi_block_tables.size(), 3u);
+  EXPECT_TRUE(torch::equal(round_trip.input_params.multi_block_tables[0],
+                           torch::tensor({{11, 12}}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(round_trip.input_params.multi_block_tables[1],
+                           torch::tensor({{21, 22}}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(round_trip.input_params.multi_block_tables[2],
+                           torch::tensor({{31, 32}}, torch::kInt32)));
 }
 
 TEST(BatchTest, ForwardInputBlockCopyKernelFieldsMatchExpectedLayout) {

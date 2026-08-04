@@ -206,6 +206,8 @@ TEST(Dsv4CpExecutionContextTest, BundledProjectionUsesOneCollective) {
   ASSERT_EQ(outputs.size(), 2);
   EXPECT_EQ(outputs[0].sizes(), torch::IntArrayRef({4, 2}));
   EXPECT_EQ(outputs[1].sizes(), torch::IntArrayRef({4, 3}));
+  EXPECT_TRUE(outputs[0].is_contiguous());
+  EXPECT_TRUE(outputs[1].is_contiguous());
   EXPECT_EQ(process_group.allgather_calls(), 1);
 }
 

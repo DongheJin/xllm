@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "embedding_block_manager.h"
+#include "framework/block/block_utils.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
 #include "linear_state_block_manager.h"
 #include "sliding_window_block_manager.h"
@@ -35,11 +36,6 @@ namespace {
 
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
-
-uint32_t ceil_div(uint32_t numerator, uint32_t denominator) {
-  CHECK_GT(denominator, 0u);
-  return (numerator + denominator - 1) / denominator;
-}
 
 // Whether a leaf of the given BlockType participates in prefix cache under
 // the current role. On the PREFILL side (instance_is_decode == false) every
@@ -229,12 +225,11 @@ CompositeBlockManager::LeafMap build_composite_leaves(
       const uint32_t sliding_window_size =
           std::max(options.sliding_window_size(), 1u);
       const uint32_t max_seqs = std::max(options.max_seqs_per_batch(), 1u);
-      const uint32_t burst_blocks =
-          ceil_div(std::max(options.max_tokens_per_batch(), 1u),
-                   static_cast<uint32_t>(options.block_size()));
-      // Slack fits the peak "old blocks not yet released + new tail".
-      const uint32_t swa_total_blocks =
-          swa_blocks_per_seq * max_seqs + burst_blocks + max_seqs + 2;
+      const uint32_t swa_total_blocks = static_cast<uint32_t>(
+          get_swa_pool_num_blocks(swa_blocks_per_seq,
+                                  max_seqs,
+                                  std::max(options.max_tokens_per_batch(), 1u),
+                                  options.block_size()));
       const bool swa_prefix_cache = prefix_cache_on && swa_participates;
       opts.num_blocks(swa_total_blocks)
           .swa_blocks_per_seq(swa_blocks_per_seq)

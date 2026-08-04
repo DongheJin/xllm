@@ -437,6 +437,36 @@ TEST(CompositeBlockManagerTest, SlidingWindowReleasesSkippedPhysicalBlocks) {
   manager.deallocate_for_sequence(&seq);
 }
 
+TEST(CompositeBlockManagerTest, SlidingWindowReleasesBeforeChunkGrowth) {
+  const uint32_t base_num_blocks = 4096;
+  const uint32_t window_size = kBaseBlockSize;
+  const uint32_t max_seqs_per_batch = 1;
+  const size_t chunk_tokens = kMaxTokensPerBatch;
+
+  BlockManager::Options opts = MakeCompositeOptions(
+      base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
+  CompositeBlockManager manager(build_composite_leaves(opts));
+
+  Sequence seq = MakeTestSequence(0, std::vector<int32_t>(chunk_tokens * 2, 1));
+  ASSERT_TRUE(manager.allocate_sequence(&seq, chunk_tokens));
+  seq.kv_state().incr_kv_cache_tokens_num(chunk_tokens);
+
+  ASSERT_TRUE(manager.allocate_sequence(&seq, chunk_tokens * 2));
+  const std::vector<Block> swa = SwaBlocks(seq);
+  ASSERT_EQ(swa.size(), CeilBlocks(chunk_tokens * 2, kBaseBlockSize));
+
+  const size_t released_blocks =
+      (chunk_tokens - window_size + 1) / kBaseBlockSize;
+  for (size_t i = 0; i < released_blocks; ++i) {
+    EXPECT_FALSE(swa[i].is_valid()) << "block=" << i;
+  }
+  for (size_t i = released_blocks; i < swa.size(); ++i) {
+    EXPECT_TRUE(swa[i].is_valid()) << "block=" << i;
+  }
+
+  manager.deallocate_for_sequence(&seq);
+}
+
 TEST(CompositeBlockManagerTest, DeallocateSliceDispatchesToOwnerManagers) {
   BlockManager::Options opts =
       MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);

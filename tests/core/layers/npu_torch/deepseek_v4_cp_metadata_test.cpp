@@ -20,7 +20,10 @@ limitations under the License.
 #include <cstdint>
 #include <vector>
 
+#include "framework/model/model_input_params.h"
 #include "framework/parallel_state/npu_cp_plan.h"
+#include "layers/common/attention_metadata.h"
+#include "layers/common/dsa_metadata_builder.h"
 
 namespace xllm::layer {
 namespace {
@@ -137,6 +140,46 @@ TEST(Dsv4CpMetadataBuilderTest, RejectsKvLengthShorterThanQueryLength) {
                                             /*global_kv_seq_lens=*/{7},
                                             torch::Device(torch::kCPU)),
                "kv_seq_len >= q_seq_len");
+}
+
+TEST(Dsv4CpMetadataBuilderTest,
+     TokenCacheSlotsCoverTrailingCompressedPaddingRows) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  params.meta.num_sequences = 1;
+  params.meta.actual_num_sequences = 1;
+  params.meta.q_max_seq_len = 8;
+  params.meta.kv_max_seq_len = 8;
+  params.attention.host.q_seq_lens = {8};
+  params.attention.host.kv_seq_lens = {8};
+  params.attention.device.q_seq_lens = torch::tensor({8}, torch::kInt32);
+  params.attention.device.kv_seq_lens = torch::tensor({8}, torch::kInt32);
+  params.attention.device.q_cu_seq_lens = torch::tensor({8}, torch::kInt32);
+  params.attention.device.new_cache_slots = torch::arange(8, torch::kInt32);
+  params.attention.device.block_tables = torch::empty({0, 0}, torch::kInt32);
+  params.multi_block_tables = {torch::tensor({7}, torch::kInt32).view({1, 1})};
+
+  const std::vector<DSAGroupInfo> group_infos = {
+      {DSACacheType::TOKEN, /*ratio=*/4, /*block_size=*/128}};
+  const std::vector<std::vector<DSACacheInfo>> caches_info = {
+      {{/*group_id=*/0,
+        DSACacheType::TOKEN,
+        /*ratio=*/4,
+        /*block_size=*/128}}};
+  const AttentionMetadata metadata =
+      DSAMetadataBuilder::build(params,
+                                torch::arange(8, torch::kInt32),
+                                torch::Tensor(),
+                                caches_info,
+                                group_infos);
+
+  ASSERT_NE(metadata.dsa_metadata, nullptr);
+  const DSAMetadata& dsa = *metadata.dsa_metadata;
+  ASSERT_EQ(dsa.c4_pad_positions.numel(), 3);
+  ASSERT_EQ(dsa.slot_mappings.size(), 1u);
+  ASSERT_EQ(dsa.slot_mappings[0].size(), 1u);
+  EXPECT_EQ(tensor_values<int32_t>(dsa.slot_mappings[0][0]),
+            std::vector<int32_t>({7 * 128, 7 * 128 + 1, -1}));
 }
 
 }  // namespace

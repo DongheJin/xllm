@@ -2445,6 +2445,7 @@ inline void deserialize_forward_input_payload(
   int32_t manager_num = 0;
   read_data(context, manager_num);
   CHECK_GE(manager_num, 0) << "multi_block_tables manager num is invalid.";
+  input_params.multi_block_tables.clear();
   input_params.multi_block_tables.reserve(static_cast<size_t>(manager_num));
   for (int32_t i = 0; i < manager_num; ++i) {
     torch::Tensor manager_table;

@@ -298,6 +298,25 @@ void init_npu_python_runtime() {
         "_npu_mod._original_pid = os.getpid()\n"
         "torch_npu._C._npu_setDevice(" +
         std::to_string(device_index) + ")\n");
+
+    // CANN's embedded TBE compiler lazily starts a Python forkserver for
+    // fused custom operators. Do not preload libtorch_npu into the forkserver
+    // interpreter: its native signal handlers are represented as None by
+    // Python and cannot be restored in forkserver workers.
+    if (KernelConfig::get_instance().enable_fused_mc2() > 0) {
+      py::exec(
+          "import os as _xllm_os\n"
+          "import multiprocessing as _xllm_mp\n"
+          "import multiprocessing.forkserver as _xllm_forkserver\n"
+          "_xllm_ld_preload = _xllm_os.environ.pop('LD_PRELOAD', None)\n"
+          "try:\n"
+          "    _xllm_mp.get_context('forkserver').set_forkserver_preload([])\n"
+          "    _xllm_forkserver.ensure_running()\n"
+          "finally:\n"
+          "    if _xllm_ld_preload is not None:\n"
+          "        _xllm_os.environ['LD_PRELOAD'] = _xllm_ld_preload\n"
+          "del _xllm_ld_preload\n");
+    }
   }
 
   if (we_initialized_python) {

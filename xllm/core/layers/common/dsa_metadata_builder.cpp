@@ -54,6 +54,19 @@ int64_t vector_max_or_zero(const std::vector<int32_t>& values) {
   return *std::max_element(values.begin(), values.end());
 }
 
+int64_t compressed_output_row_count(int64_t num_tokens,
+                                    int32_t batch_size,
+                                    int32_t ratio,
+                                    bool is_acl_graph) {
+  CHECK_GE(num_tokens, 0);
+  CHECK_GE(batch_size, 0);
+  CHECK_GT(ratio, 0);
+  if (is_acl_graph) {
+    return num_tokens;
+  }
+  return std::min<int64_t>(num_tokens, num_tokens / ratio + batch_size);
+}
+
 torch::Tensor pad_block_table(const torch::Tensor& block_table,
                               int32_t target_rows,
                               int32_t target_cols,
@@ -404,10 +417,10 @@ void DSAMetadataBuilder::process_token_group(
 
   // Token caches write only the compressed rows produced by the current
   // forward step. Padded RoPE/compressor rows must not become cache writes.
+  const int64_t padded_output_rows = compressed_output_row_count(
+      query_total_tokens, batch_size, ratio, graph_slot_capacity > 0);
   const int64_t out_slot_rows =
-      graph_slot_capacity > 0
-          ? std::max<int64_t>(graph_slot_capacity, committed_rows)
-          : committed_rows;
+      std::max({graph_slot_capacity, committed_rows, padded_output_rows});
   auto out_slots_tensor = torch::full({out_slot_rows}, -1, raw_bt.options());
   auto out_slots_acc = out_slots_tensor.accessor<int32_t, 1>();
   auto raw_bt_acc = raw_bt.accessor<int32_t, 2>();
@@ -707,13 +720,9 @@ void DSAMetadataBuilder::build_positions(const ModelInputParams& params,
     }
 
     const int64_t c4_target =
-        is_acl_graph
-            ? num_tokens
-            : std::min<int64_t>(num_tokens, num_tokens / 4 + batch_size);
+        compressed_output_row_count(num_tokens, batch_size, 4, is_acl_graph);
     const int64_t c128_target =
-        is_acl_graph
-            ? num_tokens
-            : std::min<int64_t>(num_tokens, num_tokens / 128 + batch_size);
+        compressed_output_row_count(num_tokens, batch_size, 128, is_acl_graph);
     c4_positions.resize(static_cast<size_t>(std::max<int64_t>(c4_target, 0)),
                         0);
     c128_positions.resize(
@@ -763,10 +772,8 @@ void DSAMetadataBuilder::build_positions(const ModelInputParams& params,
         compressed.push_back((pos + 1) - ratio);
       }
     }
-    const int64_t target =
-        is_acl_graph
-            ? num_tokens
-            : std::min<int64_t>(num_tokens, num_tokens / ratio + batch_size);
+    const int64_t target = compressed_output_row_count(
+        num_tokens, batch_size, ratio, is_acl_graph);
     compressed.resize(static_cast<size_t>(std::max<int64_t>(target, 0)), 0);
     auto tensor = torch::tensor(compressed, cpu_options);
     return tensor;

@@ -849,6 +849,12 @@ const CpPlanRuntimeConfig& WorkerImpl::npu_cp_plan_runtime_config() const {
         << error_message;
     const NpuModelCpCapability cp_capability =
         ModelRegistry::get_npu_cp_capability(resolved_name);
+    if (cp_capability.requires_split_compressor) {
+      CHECK(kernel::npu::has_split_compressor())
+          << "NPU CP for model_type=" << resolved_name
+          << " requires CompressorProjection and CompressorCore custom "
+             "operators";
+    }
     cfg.model_managed_global_cache =
         cp_capability.metadata_policy ==
         CpMetadataPolicy::MODEL_MANAGED_GLOBAL_CACHE;

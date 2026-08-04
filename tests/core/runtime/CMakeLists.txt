@@ -95,6 +95,18 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
+cc_test(
+  NAME
+    mtp_token_consensus_test
+  SRCS
+    mtp_token_consensus_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/runtime/mtp_token_consensus.cpp"
+  DEPS
+    :parallel_state
+    torch
+    GTest::gtest_main
+)
+
 if(USE_MLU)
   cc_test(
     NAME
