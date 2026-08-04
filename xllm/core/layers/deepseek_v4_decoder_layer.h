@@ -30,6 +30,7 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "framework/state_dict/utils.h"
 #include "npu_torch/deepseek_sparse_attention.h"
+#include "npu_torch/deepseek_v4_cp_metadata.h"
 #include "npu_torch/deepseek_v4_gate.h"
 #include "npu_torch/fused_moe.h"
 
@@ -57,7 +58,8 @@ class DeepseekV4DecoderLayerImpl : public torch::nn::Module {
       const AttentionMetadata& attn_metadata,
       KVCache& kv_cache,
       const ModelInputParams& input_params,
-      const std::optional<torch::Tensor>& input_ids = std::nullopt);
+      const std::optional<torch::Tensor>& input_ids = std::nullopt,
+      const Dsv4CpMetadata* cp_metadata = nullptr);
 
  private:
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(

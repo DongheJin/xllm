@@ -33,6 +33,84 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
+constexpr uint64_t kFnvPrime = 1099511628211ULL;
+
+void hash_bytes(uint64_t& hash, const void* data, size_t size) {
+  const uint8_t* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= kFnvPrime;
+  }
+}
+
+template <typename T>
+void hash_value(uint64_t& hash, const T& value) {
+  hash_bytes(hash, &value, sizeof(T));
+}
+
+void hash_int32_vector(uint64_t& hash, const std::vector<int32_t>& values) {
+  const uint64_t size = static_cast<uint64_t>(values.size());
+  hash_value(hash, size);
+  if (!values.empty()) {
+    hash_bytes(hash, values.data(), values.size() * sizeof(int32_t));
+  }
+}
+
+void hash_cpu_tensor(uint64_t& hash, const torch::Tensor& tensor) {
+  CHECK(tensor.defined());
+  CHECK(tensor.device().is_cpu());
+  const torch::Tensor contiguous = tensor.contiguous();
+  const int32_t dtype = static_cast<int32_t>(contiguous.scalar_type());
+  hash_value(hash, dtype);
+  const uint64_t dim_count = static_cast<uint64_t>(contiguous.dim());
+  hash_value(hash, dim_count);
+  for (int64_t size : contiguous.sizes()) {
+    hash_value(hash, size);
+  }
+  const size_t byte_count =
+      static_cast<size_t>(contiguous.numel()) * contiguous.element_size();
+  hash_bytes(hash, contiguous.data_ptr(), byte_count);
+}
+
+uint64_t compute_row_layout_signature(const CpPlanInput& input,
+                                      int32_t cp_size,
+                                      int32_t cp_rank,
+                                      const CpInputShardMeta& shard_meta,
+                                      const CpOutputMergeMeta& merge_meta) {
+  uint64_t hash = kFnvOffsetBasis;
+  hash_value(hash, cp_size);
+  hash_value(hash, cp_rank);
+  hash_int32_vector(hash, input.q_seq_lens);
+  hash_cpu_tensor(hash, input.position_ids);
+  hash_cpu_tensor(hash, shard_meta.input_source_indices);
+  hash_cpu_tensor(hash, shard_meta.input_destination_indices);
+  hash_cpu_tensor(hash, merge_meta.output_restore_indices);
+  return hash;
+}
+
+bool has_empty_cp_rank(const std::vector<int32_t>& q_seq_lens,
+                       int32_t cp_size) {
+  std::vector<int64_t> real_rows_per_rank(cp_size, 0);
+  const int32_t chunk_count = 2 * cp_size;
+  for (int32_t q_seq_len : q_seq_lens) {
+    const int32_t padded_length =
+        ((q_seq_len + chunk_count - 1) / chunk_count) * chunk_count;
+    const int32_t chunk_length = padded_length / chunk_count;
+    for (int32_t cp_rank = 0; cp_rank < cp_size; ++cp_rank) {
+      const int32_t front_start = cp_rank * chunk_length;
+      const int32_t back_start = (chunk_count - 1 - cp_rank) * chunk_length;
+      real_rows_per_rank[cp_rank] +=
+          std::max(0, std::min(chunk_length, q_seq_len - front_start));
+      real_rows_per_rank[cp_rank] +=
+          std::max(0, std::min(chunk_length, q_seq_len - back_start));
+    }
+  }
+  return std::any_of(real_rows_per_rank.begin(),
+                     real_rows_per_rank.end(),
+                     [](int64_t row_count) { return row_count == 0; });
+}
+
 torch::Tensor generate_query_balance_indices(
     const torch::Tensor& input_lengths) {
   CHECK_EQ(input_lengths.scalar_type(), torch::kInt32)
@@ -954,6 +1032,142 @@ torch::Tensor map_cache_slots_to_kv_shard(
 
 }  // namespace
 
+CpRowLayout CpRowLayout::build(const CpPlanInput& input,
+                               int32_t cp_size,
+                               int32_t cp_rank,
+                               const torch::Device& device) {
+  CHECK_GT(cp_size, 1) << "CP row layout requires cp_size > 1";
+  CHECK_GE(cp_rank, 0);
+  CHECK_LT(cp_rank, cp_size);
+  CHECK(input.position_ids.defined());
+  CHECK(input.position_ids.device().is_cpu());
+  CHECK_EQ(input.position_ids.scalar_type(), torch::kInt32);
+
+  CpRowLayout layout;
+  layout.cp_size_ = cp_size;
+  layout.cp_rank_ = cp_rank;
+  layout.has_empty_rank_ = has_empty_cp_rank(input.q_seq_lens, cp_size);
+  layout.input_shard_meta_ = build_input_shard_meta(
+      cp_size, cp_rank, input.q_seq_lens, input.position_ids);
+  layout.output_merge_meta_ = build_output_merge_meta(
+      cp_size, input.q_seq_lens, layout.local_padded_token_count());
+  layout.signature_ = compute_row_layout_signature(input,
+                                                   cp_size,
+                                                   cp_rank,
+                                                   layout.input_shard_meta_,
+                                                   layout.output_merge_meta_);
+  return layout.to(device);
+}
+
+CpRowLayout CpRowLayout::to(const torch::Device& device) const {
+  CpRowLayout result = *this;
+  result.input_shard_meta_ =
+      copy_input_shard_meta_to(input_shard_meta_, device);
+  result.output_merge_meta_ =
+      copy_output_merge_meta_to(output_merge_meta_, device);
+  return result;
+}
+
+torch::Tensor CpRowLayout::shard_rows(const torch::Tensor& global_rows,
+                                      const c10::Scalar& pad_value) const {
+  CHECK(global_rows.defined());
+  CHECK_GE(global_rows.dim(), 1);
+  CHECK_EQ(global_rows.size(0), global_real_token_count())
+      << "CP rows must be sharded exactly once from global-real layout";
+
+  std::vector<int64_t> output_shape = global_rows.sizes().vec();
+  output_shape[0] = local_padded_token_count();
+  torch::Tensor local_rows =
+      torch::full(output_shape, pad_value, global_rows.options());
+  if (local_real_token_count() == 0) {
+    return local_rows;
+  }
+
+  torch::Tensor selected = global_rows.index_select(
+      /*dim=*/0, input_shard_meta_.input_source_indices);
+  local_rows.index_copy_(
+      /*dim=*/0, input_shard_meta_.input_destination_indices, selected);
+  return local_rows;
+}
+
+torch::Tensor CpRowLayout::pack_local_real_rows(
+    const torch::Tensor& local_padded_rows) const {
+  CHECK(local_padded_rows.defined());
+  CHECK_GE(local_padded_rows.dim(), 1);
+  CHECK_EQ(local_padded_rows.size(0), local_padded_token_count())
+      << "CP local rows must use the local-padded layout before packing";
+  return local_padded_rows.index_select(
+      /*dim=*/0, input_shard_meta_.input_destination_indices);
+}
+
+torch::Tensor CpRowLayout::scatter_local_real_rows(
+    const torch::Tensor& local_real_rows,
+    const c10::Scalar& pad_value) const {
+  CHECK(local_real_rows.defined());
+  CHECK_GE(local_real_rows.dim(), 1);
+  CHECK_EQ(local_real_rows.size(0), local_real_token_count())
+      << "CP local-real row count does not match the row layout";
+
+  std::vector<int64_t> output_shape = local_real_rows.sizes().vec();
+  output_shape[0] = local_padded_token_count();
+  torch::Tensor local_padded_rows =
+      torch::full(output_shape, pad_value, local_real_rows.options());
+  if (local_real_token_count() > 0) {
+    local_padded_rows.index_copy_(
+        /*dim=*/0,
+        input_shard_meta_.input_destination_indices,
+        local_real_rows);
+  }
+  return local_padded_rows;
+}
+
+torch::Tensor CpRowLayout::gather_global_rows(
+    const torch::Tensor& local_padded_rows,
+    ProcessGroup* cp_group) const {
+  CHECK(local_padded_rows.defined());
+  CHECK_GE(local_padded_rows.dim(), 1);
+  CHECK_EQ(local_padded_rows.size(0), local_padded_token_count())
+      << "CP rows must be gathered exactly once from local-padded layout";
+  CHECK(cp_group != nullptr) << "CP row gather requires a process group";
+  CHECK_EQ(cp_group->world_size(), cp_size_)
+      << "CP row gather process_group size mismatch";
+  CHECK_EQ(cp_group->rank(), cp_rank_)
+      << "CP row gather process_group rank mismatch";
+
+  torch::Tensor gathered =
+      parallel_state::gather(local_padded_rows, cp_group, /*dim=*/0);
+  return gathered.index_select(
+      /*dim=*/0, output_merge_meta_.output_restore_indices);
+}
+
+std::vector<torch::Tensor> CpRowLayout::gather_global_rows_bundle(
+    torch::TensorList local_padded_tensors,
+    ProcessGroup* cp_group) const {
+  CHECK(!local_padded_tensors.empty());
+  const torch::Tensor& first = local_padded_tensors.front();
+  CHECK(first.defined());
+  CHECK_EQ(first.dim(), 2) << "CP row bundle accepts only 2-D tensors";
+
+  std::vector<int64_t> widths;
+  widths.reserve(local_padded_tensors.size());
+  std::vector<torch::Tensor> tensors;
+  tensors.reserve(local_padded_tensors.size());
+  for (const torch::Tensor& tensor : local_padded_tensors) {
+    CHECK(tensor.defined());
+    CHECK_EQ(tensor.dim(), 2) << "CP row bundle accepts only 2-D tensors";
+    CHECK_EQ(tensor.size(0), local_padded_token_count());
+    CHECK_EQ(tensor.scalar_type(), first.scalar_type());
+    CHECK_EQ(tensor.device(), first.device());
+    CHECK(tensor.is_contiguous());
+    widths.push_back(tensor.size(1));
+    tensors.push_back(tensor);
+  }
+
+  torch::Tensor local_bundle = torch::cat(tensors, /*dim=*/1);
+  torch::Tensor global_bundle = gather_global_rows(local_bundle, cp_group);
+  return global_bundle.split_with_sizes(widths, /*dim=*/1);
+}
+
 // Extracts the global-real CpPlanInput from a ForwardInput: positions and
 // per-seq lengths come from the host view (or the device fallback), prefix
 // counts and block tables from the attention metadata.
@@ -1063,26 +1277,37 @@ NpuCpPlan NpuCpPlan::build(const CpPlanInput& input,
   plan.kv_split_size_ = config.kv_split_size;
   plan.kv_split_rank_ = config.kv_split_rank;
   plan.block_size_ = config.block_size;
-  plan.input_shard_meta_ = build_input_shard_meta(
-      config.cp_size, config.cp_rank, input.q_seq_lens, input.position_ids);
-  plan.attention_meta_ = build_attention_meta(plan.input_shard_meta_,
+  plan.projection_gather_mode_ = config.projection_gather_mode;
+  plan.global_q_seq_lens_ = input.q_seq_lens;
+  plan.global_kv_seq_lens_.reserve(input.q_seq_lens.size());
+  for (size_t sequence_index = 0; sequence_index < input.q_seq_lens.size();
+       ++sequence_index) {
+    const int32_t prefix_tokens =
+        input.has_prefix_slots ? input.prefix_token_counts[sequence_index] : 0;
+    CHECK_GE(prefix_tokens, 0);
+    plan.global_kv_seq_lens_.push_back(input.q_seq_lens[sequence_index] +
+                                       prefix_tokens);
+  }
+  plan.row_layout_ =
+      CpRowLayout::build(input, config.cp_size, config.cp_rank, torch::kCPU);
+  const CpInputShardMeta& input_shard_meta =
+      plan.row_layout_.input_shard_meta();
+  plan.attention_meta_ = build_attention_meta(input_shard_meta,
                                               config.cp_size,
                                               input.has_prefix_slots,
                                               input.prefix_token_counts,
                                               input.block_tables,
                                               config.block_size,
                                               config.kv_split_size);
-  plan.attention_meta_.host_q_seq_lens =
-      preserve_length_layout(plan.input_shard_meta_.local_padded_seq_lens,
-                             input.q_seq_lens_are_cumulative);
-  plan.attention_meta_.host_kv_seq_lens =
-      preserve_length_layout(plan.input_shard_meta_.local_padded_seq_lens,
-                             input.kv_seq_lens_are_cumulative);
+  plan.attention_meta_.host_q_seq_lens = preserve_length_layout(
+      input_shard_meta.local_padded_seq_lens, input.q_seq_lens_are_cumulative);
+  plan.attention_meta_.host_kv_seq_lens = preserve_length_layout(
+      input_shard_meta.local_padded_seq_lens, input.kv_seq_lens_are_cumulative);
   plan.attention_meta_.host_q_cu_seq_lens.reserve(
-      plan.input_shard_meta_.local_padded_seq_lens.size());
+      input_shard_meta.local_padded_seq_lens.size());
   int32_t cumulative_length = 0;
   int32_t max_seq_len = 0;
-  for (int32_t length : plan.input_shard_meta_.local_padded_seq_lens) {
+  for (int32_t length : input_shard_meta.local_padded_seq_lens) {
     cumulative_length += length;
     plan.attention_meta_.host_q_cu_seq_lens.push_back(cumulative_length);
     max_seq_len = std::max(max_seq_len, length);
@@ -1099,22 +1324,15 @@ NpuCpPlan NpuCpPlan::build(const CpPlanInput& input,
   plan.attention_meta_.q_cu_seq_lens =
       torch::tensor(plan.attention_meta_.host_q_cu_seq_lens, cpu_int32);
   plan.cp_ep_meta_ =
-      build_cp_ep_meta(plan.input_shard_meta_.local_padded_token_count, config);
-  plan.output_merge_meta_ =
-      build_output_merge_meta(config.cp_size,
-                              input.q_seq_lens,
-                              plan.input_shard_meta_.local_padded_token_count);
+      build_cp_ep_meta(input_shard_meta.local_padded_token_count, config);
   return plan.to(config.device);
 }
 
 NpuCpPlan NpuCpPlan::to(const torch::Device& device) const {
   NpuCpPlan result = *this;
-  result.input_shard_meta_ =
-      copy_input_shard_meta_to(input_shard_meta_, device);
+  result.row_layout_ = row_layout_.to(device);
   result.attention_meta_ = copy_attention_meta_to(attention_meta_, device);
   result.cp_ep_meta_ = copy_cp_ep_meta_to(cp_ep_meta_, device);
-  result.output_merge_meta_ =
-      copy_output_merge_meta_to(output_merge_meta_, device);
   return result;
 }
 
@@ -1124,26 +1342,15 @@ void NpuCpPlan::shard_model_input(torch::Tensor& hidden_states,
     return;
   }
   CHECK_EQ(hidden_states.dim(), 2);
-  if (input_shard_meta_.global_real_token_count == 0) {
-    CHECK_EQ(input_shard_meta_.local_padded_token_count, 0);
+  if (row_layout_.global_real_token_count() == 0) {
     hidden_states = hidden_states.slice(/*dim=*/0, /*start=*/0, /*end=*/0);
-    position_ids = input_shard_meta_.local_position_ids;
+    position_ids = row_layout_.input_shard_meta().local_position_ids;
     return;
   }
-  CHECK_EQ(hidden_states.size(0), input_shard_meta_.global_real_token_count)
-      << "NPU CP model input must be sharded exactly once from global layout";
-  CHECK_EQ(position_ids.numel(), input_shard_meta_.global_real_token_count)
+  CHECK_EQ(position_ids.numel(), row_layout_.global_real_token_count())
       << "NPU CP positions must be sharded exactly once from global layout";
-
-  torch::Tensor local_hidden_states = torch::zeros(
-      {input_shard_meta_.local_padded_token_count, hidden_states.size(1)},
-      hidden_states.options());
-  torch::Tensor local_source = hidden_states.index_select(
-      /*dim=*/0, input_shard_meta_.input_source_indices);
-  local_hidden_states.index_put_({input_shard_meta_.input_destination_indices},
-                                 local_source);
-  hidden_states = std::move(local_hidden_states);
-  position_ids = input_shard_meta_.local_position_ids;
+  hidden_states = row_layout_.shard_rows(hidden_states, /*pad_value=*/0);
+  position_ids = row_layout_.input_shard_meta().local_position_ids;
 }
 
 void NpuCpPlan::apply_attention_meta(ModelInputParams& params) const {
@@ -1171,14 +1378,14 @@ torch::Tensor NpuCpPlan::prepare_cache_slots(
   }
   CHECK_EQ(global_logical_slots.dim(), 1);
   const int64_t gathered_rows = recovered_token_count();
-  CHECK_EQ(global_logical_slots.numel(),
-           input_shard_meta_.global_real_token_count)
+  CHECK_EQ(global_logical_slots.numel(), row_layout_.global_real_token_count())
       << "NPU CP cache slots must use the global-real logical layout";
 
   torch::Tensor gathered_slots =
       torch::full({gathered_rows}, -1, global_logical_slots.options());
-  gathered_slots.index_put_({output_merge_meta_.output_restore_indices},
-                            global_logical_slots);
+  gathered_slots.index_put_(
+      {row_layout_.output_merge_meta().output_restore_indices},
+      global_logical_slots);
   torch::Tensor recovered_logical_slots = gathered_slots.index_select(
       /*dim=*/0, attention_meta_.kv_reorder_indices.to(torch::kLong));
   return map_cache_slots_to_kv_shard(
@@ -1190,20 +1397,7 @@ torch::Tensor NpuCpPlan::merge_model_output(
   if (!enabled()) {
     return local_hidden_states;
   }
-  CHECK_EQ(local_hidden_states.size(0),
-           input_shard_meta_.local_padded_token_count)
-      << "NPU CP output must be merged exactly once from local layout";
-  CHECK(cp_group_ != nullptr)
-      << "NPU CP output merge requires a process_group bound via prepare() or "
-         "set_process_group()";
-  CHECK_EQ(cp_group_->world_size(), cp_size_)
-      << "NPU CP output merge process_group size mismatch";
-  CHECK_EQ(cp_group_->rank(), cp_rank_)
-      << "NPU CP output merge process_group rank mismatch";
-  torch::Tensor gathered =
-      parallel_state::gather(local_hidden_states, cp_group_, /*dim=*/0);
-  return gathered.index_select(/*dim=*/0,
-                               output_merge_meta_.output_restore_indices);
+  return row_layout_.gather_global_rows(local_hidden_states, cp_group_);
 }
 
 void NpuCpPlan::set_process_group(ProcessGroup* process_group) {
@@ -1213,13 +1407,14 @@ void NpuCpPlan::set_process_group(ProcessGroup* process_group) {
 void NpuCpPlan::prepare(ForwardInput& processed_input,
                         const CpPlanRuntimeConfig& runtime_config) {
   if (!runtime_config.enabled ||
-      processed_input.input_params.meta.batch_forward_type.is_decode()) {
+      !processed_input.input_params.meta.batch_forward_type.no_decode()) {
     return;
   }
   *this = build(make_plan_input(processed_input, runtime_config),
                 runtime_config.plan_config);
   cp_group_ = runtime_config.cp_group;
-  if (processed_input.kv_slot_layout == KvSlotLayout::LOGICAL_REAL) {
+  if (!runtime_config.model_managed_global_cache &&
+      processed_input.kv_slot_layout == KvSlotLayout::LOGICAL_REAL) {
     processed_input.input_params.attention.device.new_cache_slots =
         prepare_cache_slots(
             processed_input.input_params.attention.device.new_cache_slots);
@@ -1234,7 +1429,9 @@ void NpuCpPlan::prepare(ForwardInput& processed_input,
         << ")";
     processed_input.kv_slot_layout = KvSlotLayout::NPU_CP_RECOVERED_PHYSICAL;
   }
-  apply_attention_meta(processed_input.input_params);
+  if (!runtime_config.model_managed_global_cache) {
+    apply_attention_meta(processed_input.input_params);
+  }
 }
 
 void NpuCpPlan::replace_cp_ep_meta_storage(CpEpMeta meta) {

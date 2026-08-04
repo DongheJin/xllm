@@ -19,15 +19,13 @@ limitations under the License.
 
 #include "common/flash_comm1_context.h"
 #include "kernels/ops_api.h"
-#include "npu_torch/deepseek_v4_cp_context.h"
 
 namespace xllm {
 namespace layer {
 
 DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
     const ModelContext& context,
-    int32_t layer_id)
-    : layer_id_(layer_id) {
+    int32_t layer_id) {
   const auto& args = context.get_model_args();
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
@@ -54,7 +52,6 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
   moe_args.skip_gate_load = true;
   moe_mlp_ = register_module(
       "ffn", FusedMoE(args, moe_args, quant_args, parallel_args, options));
-  moe_mlp_->set_eplb_layer_id(layer_id_ - args.first_k_dense_replace());
   // Register as "gate" to match Python's mlp.gate module path.
   gate_ = register_module("gate", DeepseekV4Gate(context, layer_id));
 
@@ -132,19 +129,6 @@ void DeepseekV4DecoderLayerImpl::load_state_dict(const StateDict& state_dict) {
 
 void DeepseekV4DecoderLayerImpl::verify_loaded_weights() const {}
 
-void DeepseekV4DecoderLayerImpl::prepare_expert_weight(
-    const std::vector<int32_t>& expert_ids) {
-  moe_mlp_->prepare_expert_weight(expert_ids);
-}
-
-void DeepseekV4DecoderLayerImpl::start_expert_weight_transfer() {
-  moe_mlp_->start_expert_weight_transfer();
-}
-
-void DeepseekV4DecoderLayerImpl::update_expert_weight() {
-  moe_mlp_->update_expert_weight();
-}
-
 torch::Tensor DeepseekV4DecoderLayerImpl::forward(
     torch::Tensor& x,
     std::optional<torch::Tensor>& residual,
@@ -152,7 +136,8 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const ModelInputParams& input_params,
-    const std::optional<torch::Tensor>& input_ids) {
+    const std::optional<torch::Tensor>& input_ids,
+    const Dsv4CpMetadata* cp_metadata) {
   (void)positions;
 
   residual = std::nullopt;
@@ -172,6 +157,11 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   }
 
   auto& dsa = *(attn_metadata.dsa_metadata);
+  const NpuCpPlan& cp_plan = input_params.parallel.cp_plan;
+  if (cp_plan.enabled()) {
+    CHECK(cp_plan.process_group() != nullptr)
+        << "DeepSeek V4 CP attention requires a bound CP process group";
+  }
   const auto compress_metadata = std::make_tuple(
       dsa.c1_metadata, dsa.c4_metadata, dsa.c128_metadata, dsa.qli_metadata);
   KVState kv_state{kv_cache.get_swa_cache(),
@@ -186,7 +176,9 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
                           kv_state,
                           attn_metadata.is_prefill,
                           attn_metadata.is_chunked_prefill,
-                          compress_metadata);
+                          compress_metadata,
+                          cp_plan,
+                          cp_metadata);
   (void)attn_lse;
   attn_input = attn_output;
   x = hc_post(attn_input, residual_attn, post_attn, comb_attn);
@@ -200,24 +192,38 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
     ffn_input = gather_sequence(ffn_input, *fc1_ctx);
   }
 
-  // Prefill CP shards the query axis, so ffn_input holds only this rank's rows.
-  // MoE cannot run on that shard: its expert reduce spans moe_ep_group, which
-  // crosses cp_rank, and partial expert sums are only addable when every group
-  // member holds the same tokens. Gather back to the full DP-local token set
-  // for the gate and the experts, then re-shard so the residual path stays
-  // CP-local. This mirrors what the ATB CP path does through
-  // CpEpMeta::ffn_padding_indices.
-  const v4_cp::DeepseekV4CpContext* cp_ctx = dsa.v4_cp_context;
-  const bool cp_bridge_ffn = cp_ctx != nullptr && cp_ctx->enabled();
-  if (cp_bridge_ffn) {
-    ffn_input = cp_ctx->gather_restore(ffn_input);
+  std::optional<MoeRowCapability> planned_moe_capability = std::nullopt;
+  MoeRowExecutionMode moe_execution_mode = MoeRowExecutionMode::AUTO;
+  if (cp_plan.enabled()) {
+    planned_moe_capability = moe_mlp_->row_capability(input_params, ffn_input);
+    moe_execution_mode =
+        planned_moe_capability.value() ==
+                    MoeRowCapability::PRESERVES_LOCAL_ROW_ORDER &&
+                !cp_plan.row_layout().has_empty_rank()
+            ? MoeRowExecutionMode::LOCAL_ROWS
+            : MoeRowExecutionMode::GLOBAL_ROWS;
+  }
+  const bool requires_global_moe_rows =
+      moe_execution_mode == MoeRowExecutionMode::GLOBAL_ROWS;
+  const bool uses_local_moe_rows =
+      moe_execution_mode == MoeRowExecutionMode::LOCAL_ROWS;
+  if (requires_global_moe_rows) {
+    ffn_input = cp_plan.merge_model_output(ffn_input);
+  } else if (uses_local_moe_rows) {
+    ffn_input = cp_plan.row_layout().pack_local_real_rows(ffn_input);
   }
 
   auto ffn_input_2d = ffn_input.reshape({-1, ffn_input.size(-1)});
   std::optional<torch::Tensor> gate_input_ids = std::nullopt;
   if (input_ids.has_value() && input_ids.value().defined()) {
-    auto flat_input_ids =
-        input_ids.value().reshape({-1}).to(ffn_input.device());
+    torch::Tensor routed_input_ids = input_ids.value();
+    if (requires_global_moe_rows) {
+      routed_input_ids = cp_plan.merge_model_output(routed_input_ids);
+    } else if (uses_local_moe_rows) {
+      routed_input_ids =
+          cp_plan.row_layout().pack_local_real_rows(routed_input_ids);
+    }
+    auto flat_input_ids = routed_input_ids.reshape({-1}).to(ffn_input.device());
     const int64_t token_count = flat_input_ids.size(0);
     const int64_t hidden_rows = ffn_input_2d.size(0);
     if (token_count == hidden_rows) {
@@ -234,11 +240,18 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
-  ffn_input = moe_mlp_->forward_with_selected_experts(
-      ffn_input, topk_weights, topk_ids, input_params);
+  ffn_input = moe_mlp_->forward_with_selected_experts(ffn_input,
+                                                      topk_weights,
+                                                      topk_ids,
+                                                      input_params,
+                                                      planned_moe_capability,
+                                                      moe_execution_mode);
 
-  if (cp_bridge_ffn) {
-    ffn_input = cp_ctx->shard_rows(ffn_input);
+  if (requires_global_moe_rows) {
+    ffn_input = cp_plan.row_layout().shard_rows(ffn_input, /*pad_value=*/0);
+  } else if (uses_local_moe_rows) {
+    ffn_input = cp_plan.row_layout().scatter_local_real_rows(ffn_input,
+                                                             /*pad_value=*/0);
   }
 
   if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {

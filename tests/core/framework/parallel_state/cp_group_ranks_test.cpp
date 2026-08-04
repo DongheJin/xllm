@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <set>
 #include <vector>
 
@@ -137,6 +138,41 @@ TEST(ComputeCpGroupRanks, RejectsNonIntegralAttnTpSize) {
   EXPECT_DEATH(
       compute_cp_group_ranks(0, /*world_size=*/8, /*dp_size=*/2, /*cp_size=*/3),
       "");
+}
+
+TEST(ComputeCpGroupRanks, AttentionTpGroupsAreOrthogonal) {
+  struct Topology {
+    int32_t world_size;
+    int32_t dp_size;
+    int32_t cp_size;
+  };
+  const std::vector<Topology> topologies = {
+      {/*world_size=*/8, /*dp_size=*/1, /*cp_size=*/8},
+      {/*world_size=*/8, /*dp_size=*/1, /*cp_size=*/2},
+      {/*world_size=*/8, /*dp_size=*/2, /*cp_size=*/2},
+  };
+
+  for (const Topology& topology : topologies) {
+    const int32_t attention_tp_size =
+        topology.world_size / (topology.dp_size * topology.cp_size);
+    for (int32_t rank = 0; rank < topology.world_size; ++rank) {
+      const std::vector<int32_t> cp_ranks = compute_cp_group_ranks(
+          rank, topology.world_size, topology.dp_size, topology.cp_size);
+      const std::vector<int32_t> tp_ranks = compute_attention_tp_group_ranks(
+          rank, topology.world_size, topology.dp_size, topology.cp_size);
+      EXPECT_EQ(cp_ranks.size(), topology.cp_size);
+      EXPECT_EQ(tp_ranks.size(), attention_tp_size);
+      std::set<int32_t> cp_set(cp_ranks.begin(), cp_ranks.end());
+      int32_t intersection_count = 0;
+      for (int32_t tp_peer : tp_ranks) {
+        intersection_count += cp_set.count(tp_peer);
+      }
+      EXPECT_EQ(intersection_count, 1);
+      EXPECT_NE(cp_set.find(rank), cp_set.end());
+      EXPECT_NE(std::find(tp_ranks.begin(), tp_ranks.end(), rank),
+                tp_ranks.end());
+    }
+  }
 }
 
 }  // namespace

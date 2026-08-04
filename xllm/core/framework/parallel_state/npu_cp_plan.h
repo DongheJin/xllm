@@ -23,6 +23,11 @@ limitations under the License.
 namespace xllm {
 
 class ProcessGroup;
+
+enum class CpProjectionGatherMode : int8_t {
+  BUNDLED = 0,
+  SEQUENTIAL = 1,
+};
 struct ModelInputParams;
 struct ParallelInput;
 struct ForwardInput;
@@ -59,6 +64,8 @@ struct CpPlanConfig {
   int32_t num_experts_per_token = 1;
   // Dynamic EP degree 3 only applies to prefill.
   bool is_prefill = true;
+  CpProjectionGatherMode projection_gather_mode =
+      CpProjectionGatherMode::BUNDLED;
   torch::Device device = torch::kCPU;
   torch::ScalarType dtype = torch::kFloat;
 };
@@ -69,6 +76,9 @@ struct CpPlanRuntimeConfig {
   CpPlanConfig plan_config;
   ProcessGroup* cp_group = nullptr;
   bool has_prefix_slots = false;
+  // DSV4 owns global cache and attention metadata. ATB model-side CP keeps the
+  // legacy remap behavior when this flag is false.
+  bool model_managed_global_cache = false;
 };
 
 // Pre-model mapping from global-real rows to this rank's local-padded rows.
@@ -127,6 +137,64 @@ struct CpOutputMergeMeta {
   torch::Tensor output_restore_indices;
 };
 
+// Backend-neutral zigzag row ownership. It only transforms dim 0 and does not
+// contain attention, cache, compressor, or MoE semantics.
+class CpRowLayout final {
+ public:
+  CpRowLayout() = default;
+
+  static CpRowLayout build(const CpPlanInput& input,
+                           int32_t cp_size,
+                           int32_t cp_rank,
+                           const torch::Device& device);
+
+  torch::Tensor shard_rows(const torch::Tensor& global_rows,
+                           const c10::Scalar& pad_value) const;
+  torch::Tensor pack_local_real_rows(
+      const torch::Tensor& local_padded_rows) const;
+  torch::Tensor scatter_local_real_rows(const torch::Tensor& local_real_rows,
+                                        const c10::Scalar& pad_value) const;
+  torch::Tensor gather_global_rows(const torch::Tensor& local_padded_rows,
+                                   ProcessGroup* cp_group) const;
+  std::vector<torch::Tensor> gather_global_rows_bundle(
+      torch::TensorList local_padded_tensors,
+      ProcessGroup* cp_group) const;
+
+  int32_t cp_size() const { return cp_size_; }
+  int32_t cp_rank() const { return cp_rank_; }
+  int64_t global_real_token_count() const {
+    return input_shard_meta_.global_real_token_count;
+  }
+  int64_t local_real_token_count() const {
+    return input_shard_meta_.local_real_token_count;
+  }
+  int64_t local_padded_token_count() const {
+    return input_shard_meta_.local_padded_token_count;
+  }
+  int64_t gathered_padded_token_count() const {
+    return static_cast<int64_t>(cp_size_) * local_padded_token_count();
+  }
+  bool has_empty_rank() const { return has_empty_rank_; }
+  uint64_t signature() const { return signature_; }
+
+  const CpInputShardMeta& input_shard_meta() const { return input_shard_meta_; }
+  const CpOutputMergeMeta& output_merge_meta() const {
+    return output_merge_meta_;
+  }
+
+ private:
+  friend class NpuCpPlan;
+
+  CpRowLayout to(const torch::Device& device) const;
+
+  int32_t cp_size_ = 1;
+  int32_t cp_rank_ = 0;
+  bool has_empty_rank_ = false;
+  uint64_t signature_ = 0;
+  CpInputShardMeta input_shard_meta_;
+  CpOutputMergeMeta output_merge_meta_;
+};
+
 // Complete execution plan for one model-side NPU CP forward.
 class NpuCpPlan final {
  public:
@@ -138,20 +206,39 @@ class NpuCpPlan final {
   int32_t size() const { return cp_size_; }
   int32_t rank() const { return cp_rank_; }
   int64_t global_real_token_count() const {
-    return input_shard_meta_.global_real_token_count;
+    return row_layout_.global_real_token_count();
   }
   int64_t local_padded_token_count() const {
-    return input_shard_meta_.local_padded_token_count;
+    return row_layout_.local_padded_token_count();
   }
   int64_t recovered_token_count() const {
     return static_cast<int64_t>(size()) * local_padded_token_count();
   }
 
-  const CpInputShardMeta& input_shard_meta() const { return input_shard_meta_; }
+  const CpRowLayout& row_layout() const { return row_layout_; }
+  const CpInputShardMeta& input_shard_meta() const {
+    return row_layout_.input_shard_meta();
+  }
   const CpAttentionMeta& attention_meta() const { return attention_meta_; }
   const CpEpMeta& cp_ep_meta() const { return cp_ep_meta_; }
   const CpOutputMergeMeta& output_merge_meta() const {
-    return output_merge_meta_;
+    return row_layout_.output_merge_meta();
+  }
+  const std::vector<int32_t>& global_q_seq_lens() const {
+    return global_q_seq_lens_;
+  }
+  const std::vector<int32_t>& global_kv_seq_lens() const {
+    return global_kv_seq_lens_;
+  }
+  ProcessGroup* process_group() const { return cp_group_; }
+  CpProjectionGatherMode projection_gather_mode() const {
+    return projection_gather_mode_;
+  }
+
+  bool has_same_row_layout(const NpuCpPlan& other) const {
+    return enabled_ == other.enabled_ &&
+           (!enabled_ ||
+            row_layout_.signature() == other.row_layout_.signature());
   }
 
   // Build CP plan and localize attention meta after global-meta consumers.
@@ -191,13 +278,16 @@ class NpuCpPlan final {
   int32_t kv_split_size_ = 1;
   int32_t kv_split_rank_ = 0;
   int32_t block_size_ = 0;
+  CpProjectionGatherMode projection_gather_mode_ =
+      CpProjectionGatherMode::BUNDLED;
   // Non-owning CP process group bound at prepare()/set_process_group() time
   // and consumed by merge_model_output().
   ProcessGroup* cp_group_ = nullptr;
-  CpInputShardMeta input_shard_meta_;
+  std::vector<int32_t> global_q_seq_lens_;
+  std::vector<int32_t> global_kv_seq_lens_;
+  CpRowLayout row_layout_;
   CpAttentionMeta attention_meta_;
   CpEpMeta cp_ep_meta_;
-  CpOutputMergeMeta output_merge_meta_;
 };
 
 }  // namespace xllm

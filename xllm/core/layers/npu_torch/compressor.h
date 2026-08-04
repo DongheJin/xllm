@@ -53,6 +53,19 @@ class CompressorImpl : public torch::nn::Module {
                         torch::Tensor& compressed_cos,
                         torch::Tensor actual_seq_lengths_query);
 
+  torch::Tensor project(const torch::Tensor& hidden_states) const;
+
+  torch::Tensor forward_core(
+      const DSAMetadata& attn_metadata,
+      const torch::Tensor& packed_projection,
+      std::tuple<torch::Tensor, torch::Tensor>& kv_states,
+      std::tuple<torch::Tensor, torch::Tensor>& block_tables,
+      const torch::Tensor& compressed_sin,
+      const torch::Tensor& compressed_cos,
+      const torch::Tensor& actual_seq_lengths_query) const;
+
+  bool has_split_operator() const;
+
   void load_state_dict(const StateDict& state_dict);
   int64_t weight_bytes() const;
 
@@ -60,6 +73,7 @@ class CompressorImpl : public torch::nn::Module {
   torch::Tensor cmp_wkv_;
   torch::Tensor cmp_wgate_;
   torch::Tensor cmp_norm_;
+  torch::Tensor cmp_norm_fp32_;
   torch::Tensor cmp_ape_;
   bool cmp_wkv_loaded_ = false;
   bool cmp_wgate_loaded_ = false;
@@ -73,6 +87,8 @@ class CompressorImpl : public torch::nn::Module {
   double eps_;
   torch::TensorOptions options_;
   bool enable_compressor_overlap_ = false;
+
+  void check_weights_loaded() const;
 };
 TORCH_MODULE(Compressor);
 

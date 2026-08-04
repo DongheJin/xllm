@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "framework/model/model_input_params.h"
 #include "framework/parallel_state/process_group.h"
+#include "runtime/forward_params.h"
 
 namespace xllm {
 namespace {
@@ -480,12 +481,99 @@ TEST(NpuCpPlanTest, InputShardAndOutputMergeRoundTripAcrossRanks) {
   }
 }
 
+TEST(NpuCpPlanTest, RowLayoutShardsArbitraryTrailingDimensions) {
+  const CpPlanInput input = make_plan_input({5, 7, 1}, {0, 100, 200});
+  constexpr int32_t kCpSize = 4;
+  const std::vector<std::vector<int64_t>> trailing_shapes = {{}, {3}, {2, 3}};
+
+  for (const std::vector<int64_t>& trailing_shape : trailing_shapes) {
+    std::vector<int64_t> global_shape = {input.position_ids.numel()};
+    global_shape.insert(
+        global_shape.end(), trailing_shape.begin(), trailing_shape.end());
+    torch::Tensor global_rows =
+        torch::arange(torch::tensor(global_shape).prod().item<int64_t>(),
+                      torch::kInt64)
+            .view(global_shape);
+    std::vector<torch::Tensor> rank_shards;
+    rank_shards.reserve(kCpSize);
+    CpRowLayout rank0_layout;
+    for (int32_t cp_rank = 0; cp_rank < kCpSize; ++cp_rank) {
+      CpRowLayout layout =
+          CpRowLayout::build(input, kCpSize, cp_rank, torch::kCPU);
+      torch::Tensor local_rows = layout.shard_rows(global_rows, -1);
+      EXPECT_EQ(local_rows.size(0), layout.local_padded_token_count());
+      rank_shards.push_back(std::move(local_rows));
+      if (cp_rank == 0) {
+        rank0_layout = std::move(layout);
+      }
+    }
+
+    torch::Tensor rank_major = torch::cat(rank_shards, /*dim=*/0);
+    torch::Tensor restored = rank_major.index_select(
+        /*dim=*/0, rank0_layout.output_merge_meta().output_restore_indices);
+    expect_tensor_bytes_equal(restored, global_rows);
+  }
+}
+
+TEST(NpuCpPlanTest, RowLayoutPacksAndScattersLocalRealRows) {
+  const CpPlanInput input = make_plan_input({5, 7}, {0, 0});
+  const CpRowLayout layout = CpRowLayout::build(
+      input, /*cp_size=*/2, /*cp_rank=*/0, torch::Device(torch::kCPU));
+
+  torch::Tensor global =
+      torch::arange(12 * 3, torch::dtype(torch::kInt64)).view({12, 3});
+  torch::Tensor local_padded = layout.shard_rows(global, /*pad_value=*/-1);
+  torch::Tensor local_real = layout.pack_local_real_rows(local_padded);
+  torch::Tensor restored =
+      layout.scatter_local_real_rows(local_real, /*pad_value=*/-1);
+
+  EXPECT_EQ(local_real.size(0), layout.local_real_token_count());
+  EXPECT_TRUE(torch::equal(local_padded, restored));
+  torch::Tensor padding_mask =
+      local_padded.select(/*dim=*/1, /*index=*/0).eq(-1);
+  EXPECT_EQ(
+      local_real.select(/*dim=*/1, /*index=*/0).eq(-1).sum().item<int64_t>(),
+      0);
+  EXPECT_GT(padding_mask.sum().item<int64_t>(), 0);
+}
+
+TEST(NpuCpPlanTest, RowLayoutSignatureUsesValueSemantics) {
+  const CpPlanInput input = make_plan_input({5, 7}, {0, 100});
+  const CpRowLayout first =
+      CpRowLayout::build(input, /*cp_size=*/2, /*cp_rank=*/0, torch::kCPU);
+  const CpRowLayout same =
+      CpRowLayout::build(input, /*cp_size=*/2, /*cp_rank=*/0, torch::kCPU);
+  const CpRowLayout other_rank =
+      CpRowLayout::build(input, /*cp_size=*/2, /*cp_rank=*/1, torch::kCPU);
+  const CpRowLayout other_positions =
+      CpRowLayout::build(make_plan_input({5, 7}, {1, 100}),
+                         /*cp_size=*/2,
+                         /*cp_rank=*/0,
+                         torch::kCPU);
+
+  EXPECT_EQ(first.signature(), same.signature());
+  EXPECT_NE(first.signature(), other_rank.signature());
+  EXPECT_NE(first.signature(), other_positions.signature());
+}
+
+TEST(NpuCpPlanTest, PlanComparesRowOwnershipWithoutProcessGroupIdentity) {
+  const CpPlanInput input = make_plan_input({5, 7}, {0, 100});
+  CpPlanConfig config = cp2_rank0_config();
+  const NpuCpPlan target = NpuCpPlan::build(input, config);
+  const NpuCpPlan draft = NpuCpPlan::build(input, config);
+  config.cp_rank = 1;
+  const NpuCpPlan other_rank = NpuCpPlan::build(input, config);
+
+  EXPECT_TRUE(target.has_same_row_layout(draft));
+  EXPECT_FALSE(target.has_same_row_layout(other_rank));
+}
+
 TEST(NpuCpPlanTest, OutputMergeRejectsInvalidProcessGroup) {
 #if GTEST_HAS_DEATH_TEST
   NpuCpPlan plan = NpuCpPlan::build(aligned_input(), cp2_rank0_config());
   const torch::Tensor local_hidden = torch::zeros({10, 1}, torch::kFloat);
   // No process group bound -> merge must reject.
-  EXPECT_DEATH(plan.merge_model_output(local_hidden), "process_group");
+  EXPECT_DEATH(plan.merge_model_output(local_hidden), "process group");
 
   ProcessGroup wrong_size_group(
       /*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
@@ -792,6 +880,63 @@ TEST(NpuCpPlanTest, MtpTargetAndDraftShardGlobalInputsExactlyOnce) {
   EXPECT_DEATH(draft_plan.shard_model_input(draft_hidden, draft_positions),
                "exactly once");
 #endif
+}
+
+TEST(NpuCpPlanTest, MtpLayoutComparisonRejectsDifferentOwnership) {
+  const CpPlanInput input = make_plan_input({5, 7}, {0, 0});
+  const NpuCpPlan target_plan = NpuCpPlan::build(input, cp2_rank0_config());
+  const NpuCpPlan same_plan = NpuCpPlan::build(input, cp2_rank0_config());
+  EXPECT_TRUE(target_plan.has_same_row_layout(same_plan));
+
+  CpPlanConfig rank1_config = cp2_rank0_config();
+  rank1_config.cp_rank = 1;
+  const NpuCpPlan different_rank_plan = NpuCpPlan::build(input, rank1_config);
+  EXPECT_FALSE(target_plan.has_same_row_layout(different_rank_plan));
+
+  const NpuCpPlan different_position_plan =
+      NpuCpPlan::build(make_plan_input({5, 7}, {10, 20}), cp2_rank0_config());
+  EXPECT_FALSE(target_plan.has_same_row_layout(different_position_plan));
+  EXPECT_FALSE(target_plan.has_same_row_layout(NpuCpPlan()));
+}
+
+TEST(NpuCpPlanTest, PrepareOnlyActivatesForPurePrefillPhases) {
+  CpPlanRuntimeConfig runtime_config;
+  runtime_config.enabled = true;
+  runtime_config.model_managed_global_cache = true;
+  runtime_config.plan_config = cp2_rank0_config();
+  ProcessGroup process_group(/*rank=*/0,
+                             /*world_size=*/2,
+                             torch::Device(torch::kCPU));
+  runtime_config.cp_group = &process_group;
+
+  auto make_forward_input = [](BatchForwardType forward_type) {
+    ForwardInput input;
+    input.positions_host = int32_tensor({0, 1, 2, 3});
+    input.positions = input.positions_host;
+    input.input_params.meta.num_sequences = 1;
+    input.input_params.meta.batch_forward_type = forward_type;
+    input.input_params.attention.host.q_seq_lens = {4};
+    input.input_params.attention.host.kv_seq_lens = {4};
+    return input;
+  };
+
+  for (BatchForwardType forward_type :
+       {BatchForwardType::PREFILL, BatchForwardType::CHUNKED_PREFILL}) {
+    ForwardInput input = make_forward_input(forward_type);
+    NpuCpPlan plan;
+    plan.prepare(input, runtime_config);
+    EXPECT_TRUE(plan.enabled()) << forward_type.to_string();
+    EXPECT_EQ(plan.process_group(), &process_group);
+  }
+
+  for (BatchForwardType forward_type : {BatchForwardType::DECODE,
+                                        BatchForwardType::MIXED,
+                                        BatchForwardType::EMPTY}) {
+    ForwardInput input = make_forward_input(forward_type);
+    NpuCpPlan plan;
+    plan.prepare(input, runtime_config);
+    EXPECT_FALSE(plan.enabled()) << forward_type.to_string();
+  }
 }
 
 TEST(NpuCpPlanTest, CumulativeHostLayoutIsPreserved) {

@@ -67,6 +67,22 @@ enum class CpShardingMode : int8_t {
   NPU_MODEL = 1,
 };
 
+enum class CpMetadataPolicy : int8_t {
+  NONE = 0,
+  ATB_ATTENTION = 1,
+  MODEL_MANAGED_GLOBAL_CACHE = 2,
+};
+
+struct NpuModelCpCapability {
+  CpShardingMode sharding_mode = CpShardingMode::NONE;
+  CpMetadataPolicy metadata_policy = CpMetadataPolicy::NONE;
+  std::string required_backend;
+  bool supports_dp = false;
+  bool supports_mtp_prefill = false;
+  bool requires_kv_split_one = false;
+  bool requires_split_compressor = false;
+};
+
 // TODO: add default args loader.
 struct ModelMeta {
   CausalLMFactory causal_lm_factory;
@@ -78,6 +94,7 @@ struct ModelMeta {
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
+  NpuModelCpCapability npu_cp_capability;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -122,6 +139,12 @@ class ModelRegistry {
   // Read-only query of the registered CP sharding mode. Returns NONE when
   // `name` is unknown or the model did not opt into model-side CP.
   static CpShardingMode get_cp_sharding_mode(const std::string& name);
+
+  static void register_npu_cp_capability(
+      const std::string& name,
+      const NpuModelCpCapability& capability);
+
+  static NpuModelCpCapability get_npu_cp_capability(const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 

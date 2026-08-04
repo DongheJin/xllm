@@ -16,6 +16,8 @@ cc_library(
     quant_dynamic.cpp
     dequant_swiglu_quant.cpp
     compressor.cpp
+    compressor_projection.cpp
+    compressor_core.cpp
     hc_post.cpp
     quant_lightning_indexer.cpp
     lightning_indexer.cpp

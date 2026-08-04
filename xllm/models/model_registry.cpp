@@ -116,10 +116,8 @@ bool resolve_model_registration(const std::string& model_type,
   if (backend == kAutoBackend) {
     effective_backend =
         is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
-  } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
-             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
-             model_type == "qwen3_vl") {
-    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl support both backends.
+  } else if (model_type == "qwen3" || model_type == "qwen3_moe") {
+    // qwen3/qwen3_moe support both backends.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -176,26 +174,37 @@ bool resolve_model_registration_name(const std::string& model_type,
 }
 
 bool is_npu_model_cp_capable(const std::string& resolved_name) {
-  // Registers model-side CP capability for master-side validation. Note this
-  // is not the same switch as the worker-side NpuCpPlan gate: deepseek_v4 and
-  // deepseek_v4_mtp own their CP split inside the model (TORCH backend) and
-  // deliberately keep model_supports_model_cp() false so the worker does not
-  // shard a second time.
-  static const std::unordered_set<std::string> kCpCapableModels = {
+  static const std::unordered_set<std::string> kAtbCpCapableModels = {
       "deepseek_v32",
       "deepseek_v32_mtp",
-      "deepseek_v4",
-      "deepseek_v4_mtp",
       "glm_moe_dsa",
       "glm_moe_dsa_mtp",
   };
   static std::once_flag once;
   std::call_once(once, []() {
-    for (const std::string& name : kCpCapableModels) {
-      ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::NPU_MODEL);
+    NpuModelCpCapability atb_capability;
+    atb_capability.sharding_mode = CpShardingMode::NPU_MODEL;
+    atb_capability.metadata_policy = CpMetadataPolicy::ATB_ATTENTION;
+    atb_capability.required_backend = "ATB";
+    atb_capability.supports_mtp_prefill = true;
+    for (const std::string& name : kAtbCpCapableModels) {
+      ModelRegistry::register_npu_cp_capability(name, atb_capability);
     }
+
+    NpuModelCpCapability dsv4_capability;
+    dsv4_capability.sharding_mode = CpShardingMode::NPU_MODEL;
+    dsv4_capability.metadata_policy =
+        CpMetadataPolicy::MODEL_MANAGED_GLOBAL_CACHE;
+    dsv4_capability.required_backend = "TORCH";
+    dsv4_capability.supports_dp = false;
+    dsv4_capability.supports_mtp_prefill = true;
+    dsv4_capability.requires_kv_split_one = true;
+    dsv4_capability.requires_split_compressor = true;
+    ModelRegistry::register_npu_cp_capability("deepseek_v4", dsv4_capability);
+    ModelRegistry::register_npu_cp_capability("deepseek_v4_mtp",
+                                              dsv4_capability);
   });
-  return ModelRegistry::get_cp_sharding_mode(resolved_name) ==
+  return ModelRegistry::get_npu_cp_capability(resolved_name).sharding_mode ==
          CpShardingMode::NPU_MODEL;
 }
 
@@ -254,17 +263,6 @@ void ModelRegistry::register_dit_model_factory(const std::string& name,
   } else {
     instance->model_registry_[name].dit_model_factory = factory;
     instance->model_backend_[name] = "dit";
-  }
-}
-
-void ModelRegistry::register_model_backend(const std::string& name,
-                                           const std::string& backend) {
-  ModelRegistry* instance = get_instance();
-  auto [it, inserted] = instance->model_backend_.emplace(name, backend);
-  if (!inserted && it->second != backend) {
-    SAFE_LOG_WARNING("model backend for "
-                     << name << " already registered as " << it->second
-                     << "; ignoring conflicting backend " << backend << ".");
   }
 }
 
@@ -331,6 +329,24 @@ CpShardingMode ModelRegistry::get_cp_sharding_mode(const std::string& name) {
     return CpShardingMode::NONE;
   }
   return it->second.cp_sharding_mode;
+}
+
+void ModelRegistry::register_npu_cp_capability(
+    const std::string& name,
+    const NpuModelCpCapability& capability) {
+  ModelRegistry* instance = get_instance();
+  instance->model_registry_[name].npu_cp_capability = capability;
+  instance->model_registry_[name].cp_sharding_mode = capability.sharding_mode;
+}
+
+NpuModelCpCapability ModelRegistry::get_npu_cp_capability(
+    const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  if (it == instance->model_registry_.end()) {
+    return NpuModelCpCapability{};
+  }
+  return it->second.npu_cp_capability;
 }
 
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {

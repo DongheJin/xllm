@@ -1882,6 +1882,28 @@ struct CompressorParams {
   bool enable_grad = false;
 };
 
+struct CompressorProjectionParams {
+  torch::Tensor x;
+  torch::Tensor wkv;
+  torch::Tensor wgate;
+  int64_t coff = 1;
+};
+
+struct CompressorCoreParams {
+  torch::Tensor packed_projection;
+  torch::Tensor kv_state;
+  torch::Tensor score_state;
+  torch::Tensor ape;
+  torch::Tensor kv_block_table;
+  torch::Tensor score_block_table;
+  torch::Tensor cu_seqlens;
+  torch::Tensor seqused;
+  torch::Tensor start_pos;
+  int64_t output_row_count = 0;
+  int64_t cmp_ratio = 1;
+  int64_t coff = 1;
+};
+
 struct QuantLightningIndexerMetadataParams {
   int64_t num_heads_q = 0;
   int64_t num_heads_k = 0;

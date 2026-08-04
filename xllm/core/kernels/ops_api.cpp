@@ -1934,6 +1934,42 @@ compressor(CompressorParams& params) {
 #endif
 }
 
+torch::Tensor compressor_projection(CompressorProjectionParams& params) {
+#if defined(USE_NPU)
+  return npu::compressor_projection(
+      params.x, params.wkv, params.wgate, params.coff);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor compressor_core(CompressorCoreParams& params) {
+#if defined(USE_NPU)
+  return npu::compressor_core(params.packed_projection,
+                              params.kv_state,
+                              params.score_state,
+                              params.ape,
+                              params.kv_block_table,
+                              params.score_block_table,
+                              params.cu_seqlens,
+                              params.seqused,
+                              params.start_pos,
+                              params.output_row_count,
+                              params.cmp_ratio,
+                              params.coff);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+bool has_split_compressor() {
+#if defined(USE_NPU)
+  return npu::has_split_compressor();
+#else
+  return false;
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 split_qkv_rmsnorm_mrope(SplitQkvRmsnormMropeParams& params) {
 #if defined(USE_NPU)

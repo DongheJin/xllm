@@ -19,6 +19,8 @@ cc_library(
     deepseek_v4_eplb_load_utils.h
     deepseek_v4_eplb_utils.h
     deepseek_sparse_attention.h
+    deepseek_v4_cp_execution.h
+    deepseek_v4_cp_metadata.h
     compressor.h
     deepseek_v4_indexer.h
     deepseek_v4_gate.h
@@ -36,6 +38,8 @@ cc_library(
     qwen3_next_decoder_layer_impl.cpp
     qwen3_5_decoder_layer_impl.cpp
     deepseek_sparse_attention.cpp
+    deepseek_v4_cp_execution.cpp
+    deepseek_v4_cp_metadata.cpp
     compressor.cpp
     deepseek_v4_indexer.cpp
     deepseek_v4_gate.cpp

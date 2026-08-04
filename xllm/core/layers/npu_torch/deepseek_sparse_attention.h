@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "attention.h"
 #include "compressor.h"
+#include "deepseek_v4_cp_metadata.h"
 #include "deepseek_v4_indexer.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
@@ -36,6 +37,8 @@ limitations under the License.
 #include "layers/common/rotary_embedding.h"
 
 namespace xllm {
+class NpuCpPlan;
+
 namespace layer {
 
 // DSA kv state aligned with Python:
@@ -66,7 +69,9 @@ class DSAttentionImpl : public torch::nn::Module {
       bool is_chunked_prefill,
       const std::
           tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>&
-              compress_metadata);
+              compress_metadata,
+      const NpuCpPlan& cp_plan,
+      const Dsv4CpMetadata* cp_metadata);
 
   void load_state_dict(const StateDict& state_dict);
   int64_t non_registered_weight_bytes() const;

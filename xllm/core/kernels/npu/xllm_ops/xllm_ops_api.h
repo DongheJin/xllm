@@ -356,6 +356,26 @@ compressor(const at::Tensor& x,
            int64_t rotary_mode,
            bool enable_grad);
 
+torch::Tensor compressor_projection(const torch::Tensor& x,
+                                    const torch::Tensor& wkv,
+                                    const torch::Tensor& wgate,
+                                    int64_t coff);
+
+torch::Tensor compressor_core(const torch::Tensor& packed_projection,
+                              torch::Tensor& kv_state,
+                              torch::Tensor& score_state,
+                              const torch::Tensor& ape,
+                              const torch::Tensor& kv_block_table,
+                              const torch::Tensor& score_block_table,
+                              const torch::Tensor& cu_seqlens,
+                              const torch::Tensor& seqused,
+                              const torch::Tensor& start_pos,
+                              int64_t output_row_count,
+                              int64_t cmp_ratio,
+                              int64_t coff);
+
+bool has_split_compressor();
+
 at::Tensor quant_lightning_indexer_metadata(
     int64_t num_heads_q,
     int64_t num_heads_k,

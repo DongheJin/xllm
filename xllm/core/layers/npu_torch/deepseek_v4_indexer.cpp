@@ -95,8 +95,15 @@ struct SlotScatterPlan {
 
 SlotScatterPlan prepare_slot_scatter_plan(const torch::Tensor& slot_mapping,
                                           int64_t value_rows,
-                                          const c10::Device& device) {
+                                          const c10::Device& device,
+                                          bool require_exact_rows = false) {
   SlotScatterPlan plan;
+  if (require_exact_rows) {
+    CHECK(slot_mapping.defined())
+        << "DeepSeek V4 CP index cache requires slot metadata";
+    CHECK_EQ(slot_mapping.numel(), value_rows)
+        << "DeepSeek V4 CP index cache rows must match slot rows exactly";
+  }
   if (!slot_mapping.defined() || slot_mapping.numel() == 0 || value_rows <= 0) {
     return plan;
   }
@@ -334,6 +341,21 @@ torch::Tensor DeepseekV4IndexerImpl::build_query(
   return build_query(qr);
 }
 
+torch::Tensor DeepseekV4IndexerImpl::prepare_query(
+    const torch::Tensor& qr,
+    const std::optional<torch::Tensor>& qr_pertoken_scale,
+    const AttentionMetadata& attn_metadata,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin) {
+  torch::Tensor q = build_query(qr, qr_pertoken_scale);
+  const int64_t rope_start_dim =
+      std::max<int64_t>(head_dim_ - rope_head_dim_, 0);
+  q = apply_partial_rope(q, rope_start_dim, rope_head_dim_, cos, sin);
+  const torch::Tensor& hadamard =
+      get_hadamard_matrix(attn_metadata, hadamard_matrix_);
+  return rotate_activation_with_hadamard(q, hadamard, hadamard_scale_);
+}
+
 torch::Tensor DeepseekV4IndexerImpl::build_weights(const torch::Tensor& x) {
   CHECK(x.defined()) << "DeepseekV4Indexer::build_weights: x is undefined";
   return weights_proj_->forward(x) * indexer_softmax_mul_head_dim_sqrt_;
@@ -382,6 +404,72 @@ torch::Tensor DeepseekV4IndexerImpl::compress_kv(
                               actual_q_lens);
 }
 
+torch::Tensor DeepseekV4IndexerImpl::project_kv(const torch::Tensor& x) const {
+  CHECK(compressor_)
+      << "DeepseekV4Indexer::project_kv: compressor is not initialized";
+  return compressor_->project(x);
+}
+
+torch::Tensor DeepseekV4IndexerImpl::compress_kv_core(
+    const torch::Tensor& packed_projection,
+    const AttentionMetadata& attn_metadata,
+    const torch::Tensor& compressed_cos,
+    const torch::Tensor& compressed_sin,
+    const torch::Tensor& actual_seq_lengths_query,
+    std::tuple<torch::Tensor, torch::Tensor>* compressor_states,
+    std::tuple<torch::Tensor, torch::Tensor>* compressor_block_tables) const {
+  CHECK(compressor_)
+      << "DeepseekV4Indexer::compress_kv_core: compressor is not initialized";
+  CHECK(compressor_states != nullptr);
+  CHECK(compressor_block_tables != nullptr);
+  CHECK(attn_metadata.dsa_metadata != nullptr);
+  return compressor_->forward_core(*attn_metadata.dsa_metadata,
+                                   packed_projection,
+                                   *compressor_states,
+                                   *compressor_block_tables,
+                                   compressed_sin,
+                                   compressed_cos,
+                                   actual_seq_lengths_query);
+}
+
+void DeepseekV4IndexerImpl::update_kv_cache(
+    const torch::Tensor& kv,
+    torch::Tensor& index_cache,
+    torch::Tensor* quant_index_cache,
+    const AttentionMetadata& attn_metadata,
+    bool require_exact_rows) const {
+  if (!kv.defined()) {
+    CHECK(!require_exact_rows)
+        << "DeepSeek V4 CP index cache update requires defined KV rows";
+    return;
+  }
+  if (kv.numel() == 0) {
+    if (require_exact_rows) {
+      CHECK(attn_metadata.slot_mapping.defined());
+      CHECK_EQ(attn_metadata.slot_mapping.numel(), 0)
+          << "DeepSeek V4 CP empty index KV requires empty slot metadata";
+    }
+    return;
+  }
+  const torch::Tensor& hadamard =
+      get_hadamard_matrix(attn_metadata, hadamard_matrix_);
+  torch::Tensor rotated_kv =
+      rotate_activation_with_hadamard(kv, hadamard, hadamard_scale_);
+  auto [kv_quant, kv_scale] = dynamic_quant_int8(rotated_kv);
+  kv_scale = kv_scale.unsqueeze(-1).to(torch::kFloat16);
+  torch::Tensor kv_quant_2d =
+      kv_quant.reshape({-1, kv_quant.size(kv_quant.dim() - 1)});
+  SlotScatterPlan scatter_plan =
+      prepare_slot_scatter_plan(attn_metadata.slot_mapping,
+                                kv_quant_2d.size(0),
+                                index_cache.device(),
+                                require_exact_rows);
+  scatter_rows_by_prepared_slot(index_cache, scatter_plan, kv_quant);
+  if (quant_index_cache != nullptr && quant_index_cache->defined()) {
+    scatter_rows_by_prepared_slot(*quant_index_cache, scatter_plan, kv_scale);
+  }
+}
+
 std::tuple<torch::Tensor, torch::Tensor> DeepseekV4IndexerImpl::forward(
     const torch::Tensor& x,
     const torch::Tensor& qr) {
@@ -407,72 +495,44 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
     bool with_prefill,
     std::tuple<torch::Tensor, torch::Tensor>* compressor_states,
     std::tuple<torch::Tensor, torch::Tensor>* compressor_block_tables,
-    const torch::Tensor& x_kv,
-    const std::optional<torch::Tensor>& x_kv_cu_seq_lens) {
+    const std::optional<torch::Tensor>& precomputed_kv,
+    const std::optional<torch::Tensor>& precomputed_query,
+    const std::optional<torch::Tensor>& precomputed_weights) {
   CHECK(index_cache.defined())
       << "DeepseekV4Indexer::select_qli: index_cache is undefined";
 
   (void)with_prefill;
-  auto q = build_query(qr, qr_pertoken_scale);
-  if (cos.has_value() && sin.has_value()) {
-    const int64_t rope_start_dim =
-        std::max<int64_t>(head_dim_ - rope_head_dim_, 0);
-    q = apply_partial_rope(
-        q, rope_start_dim, rope_head_dim_, cos.value(), sin.value());
+  torch::Tensor q;
+  if (precomputed_query.has_value()) {
+    q = precomputed_query.value();
+  } else {
+    q = build_query(qr, qr_pertoken_scale);
+    if (cos.has_value() && sin.has_value()) {
+      const int64_t rope_start_dim =
+          std::max<int64_t>(head_dim_ - rope_head_dim_, 0);
+      q = apply_partial_rope(
+          q, rope_start_dim, rope_head_dim_, cos.value(), sin.value());
+    }
+    const torch::Tensor& hadamard =
+        get_hadamard_matrix(attn_metadata, hadamard_matrix_);
+    q = rotate_activation_with_hadamard(q, hadamard, hadamard_scale_);
   }
-  auto hadamard = get_hadamard_matrix(attn_metadata, hadamard_matrix_);
-  q = rotate_activation_with_hadamard(q, hadamard, hadamard_scale_);
-
-  // The index cache must cover every token so that top-k indices and the sparse
-  // attention block-table addressing share one global compressed coordinate
-  // space. Under CP, x_kv holds the global-ordered hidden; x stays local so
-  // build_weights() below keeps one weight row per local query.
-  const bool cp_split_inputs = x_kv.defined();
-  const torch::Tensor& kv_source = cp_split_inputs ? x_kv : x;
-  // The cu_seqlens must count the rows of the tensor it is paired with, in the
-  // compressor's (batch+1,) leading-zero cumulative layout. x_kv holds the
-  // gathered query rows of every CP rank, so it pairs with the global query
-  // cumsum -- not with actual_seq_lengths_query, which the model localized to
-  // this rank's shard, and not with actual_seq_lengths_key, which is
-  // per-sequence rather than cumulative. Feeding either of those makes the
-  // kernel's tiling read past the end and launch with blockDim == 0.
-  if (cp_split_inputs) {
-    CHECK(x_kv_cu_seq_lens.has_value() && x_kv_cu_seq_lens->defined())
-        << "DeepseekV4Indexer::select_qli: x_kv requires x_kv_cu_seq_lens";
-  }
-  const std::optional<torch::Tensor>& compress_cu_seqlens =
-      cp_split_inputs ? x_kv_cu_seq_lens : actual_seq_lengths_query;
-  auto kv = compress_kv(kv_source,
-                        attn_metadata,
-                        compressed_cos,
-                        compressed_sin,
-                        compress_cu_seqlens,
-                        compressor_states,
-                        compressor_block_tables);
-  if (kv.numel() > 0) {
-    kv = rotate_activation_with_hadamard(kv, hadamard, hadamard_scale_);
-  }
-
-  auto weights = build_weights(x);
+  torch::Tensor kv = precomputed_kv.has_value()
+                         ? precomputed_kv.value()
+                         : compress_kv(x,
+                                       attn_metadata,
+                                       compressed_cos,
+                                       compressed_sin,
+                                       actual_seq_lengths_query,
+                                       compressor_states,
+                                       compressor_block_tables);
+  torch::Tensor weights = precomputed_weights.has_value()
+                              ? precomputed_weights.value()
+                              : build_weights(x);
   auto [q_quant, q_scale] = dynamic_quant_int8(q);
   q_scale = q_scale.to(torch::kFloat16);
-  torch::Tensor kv_quant;
-  torch::Tensor kv_scale;
   if (kv.numel() > 0) {
-    std::tie(kv_quant, kv_scale) = dynamic_quant_int8(kv);
-    kv_scale = kv_scale.unsqueeze(-1);
-    kv_scale = kv_scale.to(torch::kFloat16);
-  }
-
-  if (kv.numel() > 0) {
-    torch::Tensor kv_quant_2d =
-        kv_quant.reshape({-1, kv_quant.size(kv_quant.dim() - 1)});
-    SlotScatterPlan scatter_plan = prepare_slot_scatter_plan(
-        attn_metadata.slot_mapping, kv_quant_2d.size(0), index_cache.device());
-    scatter_rows_by_prepared_slot(index_cache, scatter_plan, kv_quant);
-    if (quant_index_cache != nullptr && quant_index_cache->defined()) {
-      scatter_rows_by_prepared_slot(*quant_index_cache, scatter_plan, kv_scale);
-    }
+    update_kv_cache(kv, index_cache, quant_index_cache, attn_metadata);
   }
 
   torch::Tensor query_seq_lens;
@@ -570,10 +630,9 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
     bool with_prefill,
     std::tuple<torch::Tensor, torch::Tensor>* compressor_states,
     std::tuple<torch::Tensor, torch::Tensor>* compressor_block_tables,
-    const torch::Tensor& x_kv,
-    const std::optional<torch::Tensor>& x_kv_cu_seq_lens) {
-  // Must forward x_kv and its cu_seqlens, otherwise callers using this overload
-  // would silently lose CP and write a partial index cache.
+    const std::optional<torch::Tensor>& precomputed_kv,
+    const std::optional<torch::Tensor>& precomputed_query,
+    const std::optional<torch::Tensor>& precomputed_weights) {
   return select_qli(x,
                     qr,
                     qr_pertoken_scale,
@@ -590,8 +649,9 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
                     with_prefill,
                     compressor_states,
                     compressor_block_tables,
-                    x_kv,
-                    x_kv_cu_seq_lens);
+                    precomputed_kv,
+                    precomputed_query,
+                    precomputed_weights);
 }
 
 void DeepseekV4IndexerImpl::load_state_dict(const StateDict& state_dict) {

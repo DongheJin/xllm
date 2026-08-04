@@ -275,6 +275,34 @@ std::vector<int32_t> compute_cp_group_ranks(int32_t global_rank,
   return ranks;
 }
 
+std::vector<int32_t> compute_attention_tp_group_ranks(int32_t global_rank,
+                                                      int32_t world_size,
+                                                      int32_t dp_size,
+                                                      int32_t cp_size) {
+  CHECK_GT(cp_size, 0) << "cp_size must be positive.";
+  CHECK_GT(dp_size, 0) << "dp_size must be positive.";
+  CHECK_GT(world_size, 0) << "world_size must be positive.";
+  CHECK_EQ(world_size % (dp_size * cp_size), 0)
+      << "world_size (" << world_size
+      << ") must be divisible by dp_size * cp_size (" << dp_size * cp_size
+      << ") so that attn_tp_size is integral.";
+  CHECK_GE(global_rank, 0);
+  CHECK_LT(global_rank, world_size);
+
+  const int32_t attention_tp_size = world_size / (dp_size * cp_size);
+  const int32_t dp_stride = cp_size * attention_tp_size;
+  const int32_t dp_rank = global_rank / dp_stride;
+  const int32_t cp_rank = (global_rank % dp_stride) / attention_tp_size;
+  const int32_t group_start = dp_rank * dp_stride + cp_rank * attention_tp_size;
+
+  std::vector<int32_t> ranks;
+  ranks.reserve(attention_tp_size);
+  for (int32_t tp_rank = 0; tp_rank < attention_tp_size; ++tp_rank) {
+    ranks.push_back(group_start + tp_rank);
+  }
+  return ranks;
+}
+
 torch::Tensor scatter(torch::Tensor input,
                       ProcessGroup* process_group,
                       int dim) {

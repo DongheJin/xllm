@@ -26,6 +26,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "acl/acl.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
+#include "layers/npu_torch/deepseek_v4_cp_execution.h"
 #elif defined(USE_MLU)
 #include <framework/core/caching_allocator.h>
 #elif defined(USE_CUDA) || defined(USE_ILU)
@@ -306,6 +307,25 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   input_params.linear_state_validity_mask =
       build_linear_state_mask(rows.cached_tokens, rows.active_rows);
 }
+
+int64_t synchronize_cp_minimum(int64_t local_value, ProcessGroup* cp_group) {
+  CHECK(cp_group != nullptr);
+  torch::Tensor local = torch::tensor(
+      {local_value},
+      torch::TensorOptions().dtype(torch::kInt64).device(cp_group->device()));
+  torch::Tensor gathered = cp_group->allgather_base_sync(local);
+  return gathered.min().item<int64_t>();
+}
+
+const char* projection_gather_mode_name(CpProjectionGatherMode mode) {
+  switch (mode) {
+    case CpProjectionGatherMode::BUNDLED:
+      return "bundled";
+    case CpProjectionGatherMode::SEQUENTIAL:
+      return "sequential";
+  }
+  return "unknown";
+}
 #endif
 
 }  // namespace
@@ -582,21 +602,80 @@ bool WorkerImpl::unlink_p2p(const std::string& remote_addr) {
 
 std::tuple<int64_t, int64_t> WorkerImpl::estimate_kv_cache_capacity() {
   CHECK(model_ != nullptr) << "Model is not initialized.";
+#if defined(USE_NPU)
+  const CpPlanRuntimeConfig& cp_runtime_config = npu_cp_plan_runtime_config();
+  if (cp_runtime_config.enabled &&
+      cp_runtime_config.model_managed_global_cache) {
+    CHECK(cp_runtime_config.cp_group != nullptr);
+    torch::Tensor warmup_value =
+        torch::zeros({1},
+                     torch::TensorOptions()
+                         .dtype(torch::kInt64)
+                         .device(cp_runtime_config.cp_group->device()));
+    const torch::Tensor warmup_gathered =
+        cp_runtime_config.cp_group->allgather_base_sync(warmup_value);
+    CHECK_EQ(warmup_gathered.numel(), cp_runtime_config.cp_group->world_size());
+  }
+#endif
   size_t torch_cache = 0;
   size_t torch_largest_block = 0;
   int32_t device_id = device_.index();
+  // Read memory only after the CP communicator has initialized its persistent
+  // HCCL buffers. AllGather output tensors are accounted separately by the CP
+  // transient budget and do not use an external ProcessGroup workspace.
   Device::empty_cache(device_id);
 #if defined(USE_NPU)
   // get torch's cache memory size
   c10_npu::NPUCachingAllocator::cacheInfo(
       device_id, &torch_cache, &torch_largest_block);
 #endif
-  const auto available_memory = device_.free_memory();
-  const auto total_memory = device_.total_memory();
+  const int64_t available_memory = device_.free_memory();
+  const int64_t total_memory = device_.total_memory();
   DeviceMonitor::get_instance().set_total_memory(device_id, total_memory);
   DeviceMonitor::get_instance().set_weight_memory(
-      device_id, total_memory - available_memory - torch_cache);
-  return {available_memory + torch_cache, total_memory};
+      device_id,
+      total_memory - available_memory - static_cast<int64_t>(torch_cache));
+  int64_t cache_available_memory =
+      available_memory + static_cast<int64_t>(torch_cache);
+#if defined(USE_NPU)
+  if (cp_runtime_config.enabled &&
+      cp_runtime_config.model_managed_global_cache) {
+    CHECK(cp_runtime_config.cp_group != nullptr);
+    cache_available_memory = synchronize_cp_minimum(cache_available_memory,
+                                                    cp_runtime_config.cp_group);
+
+    const ModelArgs& model_args = context_.get_model_args();
+    const layer::Dsv4CpMemoryBudgetConfig budget_config =
+        layer::Dsv4CpMemoryBudgetEstimator::make_worst_case_config(
+            model_args,
+            options_.max_tokens_per_batch(),
+            options_.max_seqs_per_batch(),
+            parallel_args_.cp_size(),
+            torch::elementSize(dtype_),
+            /*requires_moe_bridge=*/model_args.n_routed_experts() > 0);
+    int64_t utilization_reserved_bytes = 0;
+    if (options_.max_memory_utilization() < 1.0) {
+      utilization_reserved_bytes = static_cast<int64_t>(
+          total_memory * (1.0 - options_.max_memory_utilization()));
+    }
+    const layer::Dsv4CpMemoryBudgetDecision decision =
+        layer::Dsv4CpMemoryBudgetEstimator::select_gather_mode(
+            budget_config, cache_available_memory, utilization_reserved_bytes);
+    npu_cp_runtime_config_.plan_config.projection_gather_mode =
+        decision.gather_mode;
+    cache_available_memory -= decision.budget.peak_transient_bytes;
+    CHECK_GT(cache_available_memory, 0)
+        << "DeepSeek V4 CP transient reserve leaves no memory for KV cache";
+    LOG(INFO) << "dsv4_cp_memory mode="
+              << projection_gather_mode_name(decision.gather_mode)
+              << ", persistent_owned_by_kv_estimator=true"
+              << ", transient=" << decision.budget.peak_transient_bytes
+              << ", available_before_reserve="
+              << cache_available_memory + decision.budget.peak_transient_bytes
+              << ", available_for_kv=" << cache_available_memory;
+  }
+#endif
+  return {cache_available_memory, total_memory};
 }
 
 void WorkerImpl::process_group_test() {
@@ -763,8 +842,16 @@ const CpPlanRuntimeConfig& WorkerImpl::npu_cp_plan_runtime_config() const {
       KVCacheConfig::get_instance().enable_prefix_cache() ||
       SchedulerConfig::get_instance().enable_chunked_prefill();
   if (cfg.enabled) {
-    const nlohmann::json& mapping = context_.get_parallel_args().mapping_data();
-    CHECK(!mapping.empty()) << "NPU CP plan requires parallel mapping data";
+    std::string resolved_name;
+    std::string error_message;
+    CHECK(resolve_model_registration_name(
+        context_.get_model_args().model_type(), &resolved_name, &error_message))
+        << error_message;
+    const NpuModelCpCapability cp_capability =
+        ModelRegistry::get_npu_cp_capability(resolved_name);
+    cfg.model_managed_global_cache =
+        cp_capability.metadata_policy ==
+        CpMetadataPolicy::MODEL_MANAGED_GLOBAL_CACHE;
     cfg.cp_group = parallel_args_.cp_group_;
     CpPlanConfig& plan_config = cfg.plan_config;
     plan_config.cp_size = parallel_args_.cp_size();
@@ -772,13 +859,26 @@ const CpPlanRuntimeConfig& WorkerImpl::npu_cp_plan_runtime_config() const {
     plan_config.block_size = options_.block_size();
     plan_config.kv_split_size = parallel_args_.kv_split_size_effective();
     plan_config.kv_split_rank = parallel_args_.kv_split_rank();
-    plan_config.attention_tp_size = mapping["attnTpSize"].get<int32_t>();
-    plan_config.attention_tp_rank = mapping["attnTp"]["rank"].get<int32_t>();
-    plan_config.attention_cp_size = mapping["attnCpSize"].get<int32_t>();
-    plan_config.attention_cp_group_size =
-        static_cast<int32_t>(mapping["attnCp"]["rankIds"].size());
-    plan_config.moe_ep_size =
-        mapping.contains("moeEpSize") ? mapping["moeEpSize"].get<int32_t>() : 1;
+    const nlohmann::json& mapping = context_.get_parallel_args().mapping_data();
+    if (!mapping.empty()) {
+      plan_config.attention_tp_size = mapping["attnTpSize"].get<int32_t>();
+      plan_config.attention_tp_rank = mapping["attnTp"]["rank"].get<int32_t>();
+      plan_config.attention_cp_size = mapping["attnCpSize"].get<int32_t>();
+      plan_config.attention_cp_group_size =
+          static_cast<int32_t>(mapping["attnCp"]["rankIds"].size());
+      plan_config.moe_ep_size = mapping.contains("moeEpSize")
+                                    ? mapping["moeEpSize"].get<int32_t>()
+                                    : 1;
+    } else {
+      plan_config.attention_tp_size =
+          parallel_args_.world_size() /
+          (parallel_args_.dp_size() * parallel_args_.cp_size());
+      plan_config.attention_tp_rank =
+          parallel_args_.rank() % plan_config.attention_tp_size;
+      plan_config.attention_cp_size = parallel_args_.cp_size();
+      plan_config.attention_cp_group_size = parallel_args_.cp_size();
+      plan_config.moe_ep_size = parallel_args_.ep_size();
+    }
     plan_config.expert_parallel_degree =
         EPLBConfig::get_instance().expert_parallel_degree();
     plan_config.num_experts_per_token =
@@ -933,6 +1033,9 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // CP prepare after global attention-meta consumers.
     processed_input.input_params.parallel.cp_plan.prepare(
         processed_input, npu_cp_plan_runtime_config());
+    if (processed_input.input_params.parallel.cp_plan.enabled()) {
+      processed_input.input_params.enable_graph = false;
+    }
 
     if (can_prepare_npu_graph_decode_input(input_params)) {
       model_executor_->prepare_graph_input(processed_input.token_ids,

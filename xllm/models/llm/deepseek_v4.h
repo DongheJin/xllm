@@ -42,9 +42,9 @@ limitations under the License.
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
+#include "core/layers/npu_torch/deepseek_v4_cp_metadata.h"
 #include "core/util/tensor_helper.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
-#include "layers/npu_torch/deepseek_v4_cp_context.h"
 #include "llm_model_base.h"
 
 namespace xllm {
@@ -425,23 +425,14 @@ class DeepseekV4ModelImpl
 
     num_heads_ = model_args.n_heads();
     head_dim_ = model_args.o_lora_rank() + model_args.qk_rope_head_dim();
-    // Attention TP width under the orthogonal dp * cp * attn_tp == world
-    // layout. This must match the width DSAttention actually shards heads by
-    // (it reads tp_group_->world_size(), narrowed in
-    // CollectiveCommunicator::create_process_groups). Dividing by dp alone
-    // would make the precomputed sparse metadata below advertise a head count
-    // the kernels never see.
-    cp_size_ = std::max<int64_t>(parallel_args.cp_size(), 1);
-    cp_group_ = parallel_args.cp_group_;
-    dp_local_tp_size_ = std::max<int64_t>(
-        parallel_args.world_size() /
-            std::max<int64_t>(parallel_args.dp_size(), 1) / cp_size_,
-        1);
+    CHECK(parallel_args.tp_group_ != nullptr)
+        << "DeepSeek V4 requires an attention TP process group";
+    dp_local_tp_size_ = parallel_args.tp_group_->world_size();
     CHECK_EQ(num_heads_ % dp_local_tp_size_, 0)
-        << "[DSV4][Init] n_heads must be divisible by attn tp size. n_heads="
-        << num_heads_ << ", attn_tp_size=" << dp_local_tp_size_
+        << "[DSV4][Init] n_heads must be divisible by local tp size. n_heads="
+        << num_heads_ << ", local_tp_size=" << dp_local_tp_size_
         << ", world_size=" << parallel_args.world_size()
-        << ", dp_size=" << parallel_args.dp_size() << ", cp_size=" << cp_size_;
+        << ", dp_size=" << parallel_args.dp_size();
     tp_num_heads_ = num_heads_ / dp_local_tp_size_;
     window_size_ = model_args.window_size();
     index_n_heads_ = model_args.index_n_heads();
@@ -594,35 +585,6 @@ class DeepseekV4ModelImpl
     LOAD_WEIGHT(hc_head_fn);
     LOAD_WEIGHT(hc_head_base);
     LOAD_WEIGHT(hc_head_scale);
-  }
-
-  void prepare_expert_weight(int32_t layer_id,
-                             const std::vector<int32_t>& expert_ids) {
-    CHECK_GE(layer_id, 0) << "DeepSeek V4 EPLB layer id must be non-negative.";
-    CHECK_LT(layer_id, static_cast<int32_t>(layers_.size()))
-        << "DeepSeek V4 EPLB layer id out of range: " << layer_id;
-    layers_[layer_id]->prepare_expert_weight(expert_ids);
-  }
-
-  void update_expert_weight(int32_t layer_id) {
-    CHECK_GE(layer_id, 0) << "DeepSeek V4 EPLB layer id must be non-negative.";
-    CHECK_LT(layer_id, static_cast<int32_t>(layers_.size()))
-        << "DeepSeek V4 EPLB layer id out of range: " << layer_id;
-    layers_[layer_id]->update_expert_weight();
-  }
-
-  void start_expert_weight_transfer(int32_t layer_id) {
-    CHECK_GE(layer_id, 0) << "DeepSeek V4 EPLB layer id must be non-negative.";
-    CHECK_LT(layer_id, static_cast<int32_t>(layers_.size()))
-        << "DeepSeek V4 EPLB layer id out of range: " << layer_id;
-    layers_[layer_id]->start_expert_weight_transfer();
-  }
-
-  bool last_prepare_expert_weight_ok(int32_t layer_id) const {
-    CHECK_GE(layer_id, 0) << "DeepSeek V4 EPLB layer id must be non-negative.";
-    CHECK_LT(layer_id, static_cast<int32_t>(layers_.size()))
-        << "DeepSeek V4 EPLB layer id out of range: " << layer_id;
-    return layers_[layer_id]->last_prepare_expert_weight_ok();
   }
 
   bool requires_graph_forward_metadata() { return true; }
@@ -783,9 +745,30 @@ class DeepseekV4ModelImpl
       }
     }
 
+    const NpuCpPlan& cp_plan = modified_input_params.parallel.cp_plan;
+    std::optional<layer::Dsv4CpMetadata> cp_metadata;
+    torch::Tensor layer_tokens = tokens;
+    if (cp_plan.enabled()) {
+      CHECK(!acl_graph_forward)
+          << "DeepSeek V4 CP prefill must execute outside ACL graph";
+      layer::Dsv4CpAttentionMetadataConfig cp_metadata_config;
+      cp_metadata_config.num_heads_q = tp_num_heads_;
+      cp_metadata_config.head_dim = head_dim_;
+      cp_metadata_config.window_size = window_size_;
+      cp_metadata_config.index_num_heads = index_n_heads_;
+      cp_metadata_config.index_head_dim = index_head_dim_;
+      cp_metadata_config.index_topk = index_topk_;
+      layer::Dsv4CpModelInputBundle cp_inputs;
+      cp_inputs.hidden_states = &h;
+      cp_inputs.positions = &positions;
+      cp_inputs.token_ids = &layer_tokens;
+      cp_metadata = layer::Dsv4CpModelInputPreparer::prepare(
+          cp_plan, cp_metadata_config, runtime_device, cp_inputs);
+    }
+
     const int32_t fc1_num_tokens = static_cast<int32_t>(h.size(0));
     FlashComm1Context fc1_ctx;
-    if (!acl_graph_forward && !is_empty_dp_rank) {
+    if (!acl_graph_forward && !is_empty_dp_rank && !cp_plan.enabled()) {
       const bool is_prefill_side =
           input_params.meta.batch_forward_type.no_decode();
       fc1_ctx = build_flash_comm1_context(fc1_num_tokens,
@@ -796,46 +779,6 @@ class DeepseekV4ModelImpl
     FlashComm1ContextScope fc1_scope(&fc1_ctx);
     if (is_sequence_sharded(fc1_ctx)) {
       h = shard_sequence(h, fc1_ctx);
-    }
-
-    // Prefill context parallel. Built here, after the global DSA metadata is
-    // complete, because the KV / compressor / index-cache write path keeps the
-    // global kv_seq_lens and slot_mapping: only the query axis is localized.
-    layer::v4_cp::DeepseekV4CpContext cp_ctx;
-    const bool cp_enabled = cp_size_ > 1 && cp_group_ != nullptr &&
-                            !is_empty_dp_rank &&
-                            input_params.meta.batch_forward_type.no_decode() &&
-                            attn_metadata.dsa_metadata != nullptr;
-    if (cp_enabled) {
-      // FlashComm1 SP and CP both shard tokens; running both would shard twice.
-      CHECK(!is_sequence_sharded(fc1_ctx))
-          << "DeepSeek V4 cannot combine FlashComm1 sequence parallel with "
-             "context parallel; build_flash_comm1_context must disable itself "
-             "when cp_size > 1.";
-      auto& dsa = *(attn_metadata.dsa_metadata);
-      cp_ctx = layer::v4_cp::build_deepseek_v4_cp_context(
-          static_cast<int32_t>(cp_size_),
-          cp_group_->rank(),
-          cp_group_,
-          modified_input_params.attention.host.q_seq_lens,
-          modified_input_params.attention.host.kv_seq_lens,
-          dsa.input_positions);
-      if (cp_ctx.enabled()) {
-        // Save the global-position RoPE per ratio before the query side is
-        // rebuilt against local rows. The layer loop below picks the KV table
-        // for the layer's own ratio out of this map.
-        cp_ctx.global_rope_by_ratio = input_rope_by_ratio;
-        rebuild_cp_local_query_metadata(
-            dsa, modified_input_params, cp_ctx, input_rope_by_ratio);
-        h = cp_ctx.shard_rows(h);
-        positions = cp_ctx.shard_rows(positions);
-        // tokens stays global on purpose. The decoder layer gathers the FFN
-        // input back to the full DP-local token set before the MoE gate, so the
-        // gate's input_ids must stay global to match those rows. Likewise
-        // dp_global_token_nums keeps the unsharded counts the engine published,
-        // because the MoE DP gather runs on the already CP-gathered rows.
-        dsa.v4_cp_context = &cp_ctx;
-      }
     }
 
     std::optional<torch::Tensor> residual;
@@ -869,14 +812,6 @@ class DeepseekV4ModelImpl
           // the attention kernel reads them from dsa.
           dsa.cos = rope_it->second.first;
           dsa.sin = rope_it->second.second;
-        }
-        if (cp_ctx.enabled()) {
-          // Under CP the tables above are localized to this rank's query rows.
-          // The KV / compressor / index-cache writes span all tokens, so pair
-          // them with the global table of the same ratio.
-          auto [kv_cos, kv_sin] = cp_ctx.global_rope(layer_compress_ratio);
-          dsa.kv_cos = kv_cos;
-          dsa.kv_sin = kv_sin;
         }
 
         if (layer_id < static_cast<int32_t>(dsa.block_tables.size()) &&
@@ -915,7 +850,8 @@ class DeepseekV4ModelImpl
                      attn_metadata,
                      kv_caches[i],
                      modified_input_params,
-                     tokens);
+                     layer_tokens,
+                     cp_metadata.has_value() ? &cp_metadata.value() : nullptr);
 #if defined(USE_NPU)
       if (modified_input_params.parallel.layer_synchronizer != nullptr &&
           !modified_input_params.parallel.layer_synchronizer->record_event(
@@ -927,14 +863,8 @@ class DeepseekV4ModelImpl
     if (is_sequence_sharded(fc1_ctx)) {
       h = gather_sequence(h, fc1_ctx);
     }
-    if (cp_ctx.enabled()) {
-      // Restore full global-order tokens before hc_head / norm / lm_head, which
-      // are not CP-aware. Done before capturing pre_hc_head_hidden_states so
-      // MTP receives full-length aux hidden states.
-      h = cp_ctx.gather_restore(h);
-      if (attn_metadata.dsa_metadata) {
-        attn_metadata.dsa_metadata->v4_cp_context = nullptr;
-      }
+    if (cp_plan.enabled()) {
+      h = cp_plan.merge_model_output(h);
     }
     torch::Tensor pre_hc_head_hidden_states;
     if (model_args_.num_speculative_tokens() > 0) {
@@ -1396,107 +1326,6 @@ class DeepseekV4ModelImpl
     }
   }
 
-  // Rewrites the query axis to this rank's local rows, shortens the kv extent
-  // the attention / indexer kernels read to where those rows end, and rebuilds
-  // the sparse metadata derived from both. slot_mapping and block_tables stay
-  // global on purpose: every CP rank holds a full KV replica and writes it from
-  // all tokens, which is what lets local queries attend to the whole prefix
-  // without any cross-rank KV exchange.
-  //
-  // The kv lengths must shrink even though the replica is full, because
-  // sparse_attn_sharedkv aligns the query block to the END of the kv window.
-  // See DeepseekV4CpContext::local_kv_seq_lens for why a global kv length
-  // silently relocates every non-last rank's queries.
-  //
-  // Getting this wrong degrades accuracy rather than crashing, so keep the two
-  // views strictly separated: the attention read path takes both axes from
-  // cp_ctx; the write path takes its global view from cp_ctx too
-  // (global_q_cu_seq_lens) and from start_pos, which stays global below.
-  void rebuild_cp_local_query_metadata(
-      layer::DSAMetadata& dsa,
-      ModelInputParams& params,
-      const layer::v4_cp::DeepseekV4CpContext& cp_ctx,
-      std::unordered_map<int32_t, layer::DeepseekV4RotaryEmbedding::CosSinPair>&
-          input_rope_by_ratio) const {
-    const auto& local_q = cp_ctx.local_q_seq_lens;
-    const torch::Device device =
-        dsa.seq_lens_q.defined() ? dsa.seq_lens_q.device() : device_;
-    const auto int_options =
-        torch::TensorOptions().dtype(torch::kInt32).device(device);
-
-    params.attention.host.q_seq_lens = local_q;
-    torch::Tensor q_lens = torch::tensor(local_q, int_options);
-    params.attention.device.q_seq_lens = q_lens;
-    dsa.seq_lens_q = q_lens;
-    torch::Tensor q_cumsum =
-        torch::cumsum(q_lens, /*dim=*/0, /*dtype=*/torch::kInt32);
-    dsa.actual_seq_lengths_query =
-        torch::cat({torch::zeros({1}, int_options), q_cumsum});
-    params.attention.device.q_cu_seq_lens = dsa.actual_seq_lengths_query;
-    std::vector<int32_t> q_cu_host;
-    q_cu_host.reserve(local_q.size());
-    int32_t running = 0;
-    for (const int32_t len : local_q) {
-      running += len;
-      q_cu_host.push_back(running);
-    }
-    params.attention.host.q_cu_seq_lens = q_cu_host;
-
-    const int64_t local_q_max = vector_max_or_zero(local_q);
-    params.meta.q_max_seq_len = static_cast<int32_t>(local_q_max);
-    dsa.max_seqlen_q = q_lens.numel() > 0
-                           ? torch::max(q_lens).to(torch::kInt32).reshape({1})
-                           : torch::zeros({1}, int_options);
-    dsa.max_query_len = local_q_max;
-
-    // Attention-side kv view: prefix + this rank's last local row. Everything
-    // written above and below stays on the global view.
-    const auto& local_kv = cp_ctx.local_kv_seq_lens;
-    torch::Tensor kv_lens = torch::tensor(local_kv, int_options);
-    params.attention.host.kv_seq_lens = local_kv;
-    params.attention.device.kv_seq_lens = kv_lens;
-    dsa.actual_seq_lengths_kv = kv_lens;
-    dsa.seq_lens = kv_lens;
-    dsa.kv_cu_seq_lens = cp_ctx.local_kv_cu_seq_lens;
-    const int64_t local_kv_max = vector_max_or_zero(local_kv);
-    params.meta.kv_max_seq_len = static_cast<int32_t>(local_kv_max);
-    dsa.max_seqlen_kv = kv_lens.numel() > 0
-                            ? torch::max(kv_lens).to(torch::kInt32).reshape({1})
-                            : torch::zeros({1}, int_options);
-    dsa.max_seq_len = local_kv_max;
-
-    // Query RoPE follows the local rows. local_positions keeps true global
-    // positions, so RoPE values are unchanged -- only the row set shrinks.
-    if (cp_ctx.local_positions.defined()) {
-      dsa.input_positions = cp_ctx.local_positions;
-    }
-    // The layer loop reassigns dsa.cos/dsa.sin from input_rope_by_ratio, so the
-    // map itself must be rebuilt or the first layer would restore the global
-    // table and silently undo the localization.
-    input_rope_by_ratio.clear();
-    build_dsa_rope_metadata(dsa, &input_rope_by_ratio);
-
-    // start_pos deliberately keeps the global value computed before this
-    // rebuild. Its only consumers are the compressor and the indexer's
-    // compress_kv, and under CP both run on the CP-gathered global token set:
-    // start_pos is the absolute position of the first token they process, which
-    // is global_kv - global_q. Localizing it to global_kv - local_q tells them
-    // to skip a prefix that is not there, which drives the compressed block
-    // count to zero and the kernel launches with blockDim == 0.
-    // build_precomputed_metadata does not read start_pos, so nothing between
-    // here and the layer loop needs the localized form.
-    //
-    // (start_pos must not be recomputed after this point: the
-    // two fields it is derived from (actual_seq_lengths_kv - seq_lens_q) are
-    // both localized above, so re-deriving it would yield the local value the
-    // paragraph above rules out. Both call sites that build it
-    // (prepare_dsa_metadata_for_forward and the eager branch in forward()) run
-    // before the CP block, and neither prepare_forward_dsa_runtime_metadata nor
-    // build_precomputed_metadata touches it.)
-
-    build_precomputed_metadata(dsa, params, cp_ctx.local_kv_cu_seq_lens);
-  }
-
   void prepare_forward_dsa_runtime_metadata(
       layer::DSAMetadata& dsa,
       const ModelInputParams& params,
@@ -1544,16 +1373,8 @@ class DeepseekV4ModelImpl
     return *std::max_element(values.begin(), values.end());
   }
 
-  // cu_seqlens_ori_kv_override, when defined, replaces the query cumsum the
-  // prefill sparse metadata normally uses to describe ori_kv. Only prefill CP
-  // passes it: there the kv window is longer than this rank's query block, so
-  // the two stop coinciding and the kernel's baked tiling must follow the
-  // window. It has to agree with the cu_seqlens_ori_kv the attention layer
-  // passes at call time.
-  void build_precomputed_metadata(
-      layer::DSAMetadata& dsa,
-      const ModelInputParams& params,
-      const torch::Tensor& cu_seqlens_ori_kv_override = torch::Tensor()) const {
+  void build_precomputed_metadata(layer::DSAMetadata& dsa,
+                                  const ModelInputParams& params) const {
     dsa.c1_metadata = torch::Tensor();
     dsa.c4_metadata = torch::Tensor();
     dsa.c128_metadata = torch::Tensor();
@@ -1597,11 +1418,9 @@ class DeepseekV4ModelImpl
 
     const char* layout_kv = "PA_ND";
     auto empty_int32_opt = as_empty_int32_tensor(dsa.actual_seq_lengths_query);
-    const torch::Tensor& ori_kv_cu = cu_seqlens_ori_kv_override.defined()
-                                         ? cu_seqlens_ori_kv_override
-                                         : dsa.actual_seq_lengths_query;
     auto cu_seqlens_ori_kv_opt =
-        is_prefill ? as_optional_tensor(ori_kv_cu) : empty_int32_opt;
+        is_prefill ? as_optional_tensor(dsa.actual_seq_lengths_query)
+                   : empty_int32_opt;
 
     xllm::kernel::SparseAttnSharedkvMetadataParams c1_params;
     c1_params.num_heads_q = tp_num_heads_;
@@ -1766,9 +1585,6 @@ class DeepseekV4ModelImpl
   int64_t num_heads_ = 0;
   int64_t tp_num_heads_ = 0;
   int64_t dp_local_tp_size_ = 1;
-  // Prefill CP geometry. cp_size_ == 1 means CP is off everywhere below.
-  int64_t cp_size_ = 1;
-  ProcessGroup* cp_group_ = nullptr;
   int64_t head_dim_ = 0;
   int64_t window_size_ = 128;
   int64_t index_n_heads_ = 0;
@@ -1796,9 +1612,7 @@ class DeepseekV4ForCausalLMImpl
     : public LlmForCausalLMImplBase<DeepseekV4Model> {
  public:
   explicit DeepseekV4ForCausalLMImpl(const ModelContext& context)
-      : LlmForCausalLMImplBase<DeepseekV4Model>(context),
-        first_k_dense_replace_(
-            context.get_model_args().first_k_dense_replace()) {}
+      : LlmForCausalLMImplBase<DeepseekV4Model>(context) {}
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
@@ -1821,29 +1635,6 @@ class DeepseekV4ForCausalLMImpl
     this->model_->prepare_graph_forward_metadata(
         state, positions, input_params);
   }
-
-  void prepare_expert_weight(int32_t layer_id,
-                             const std::vector<int32_t>& expert_ids) override {
-    this->model_->prepare_expert_weight(layer_id + first_k_dense_replace_,
-                                        expert_ids);
-  }
-
-  void update_expert_weight(int32_t layer_id) override {
-    this->model_->update_expert_weight(layer_id + first_k_dense_replace_);
-  }
-
-  void start_expert_weight_transfer(int32_t layer_id) override {
-    this->model_->start_expert_weight_transfer(layer_id +
-                                               first_k_dense_replace_);
-  }
-
-  bool last_prepare_expert_weight_ok(int32_t layer_id) const override {
-    return this->model_->last_prepare_expert_weight_ok(layer_id +
-                                                       first_k_dense_replace_);
-  }
-
- private:
-  int32_t first_k_dense_replace_;
 };
 TORCH_MODULE(DeepseekV4ForCausalLM);
 

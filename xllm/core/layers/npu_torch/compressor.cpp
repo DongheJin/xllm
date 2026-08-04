@@ -72,6 +72,33 @@ std::string list_available_keys(const StateDict& state_dict) {
   return os.str();
 }
 
+void apply_compressor_rope(torch::Tensor& input,
+                           int64_t rope_head_dim,
+                           int64_t rotary_mode,
+                           const torch::Tensor& cos,
+                           const torch::Tensor& sin) {
+  CHECK_EQ(input.dim(), 2);
+  CHECK_GT(rope_head_dim, 0);
+  CHECK_GE(input.size(1), rope_head_dim);
+  CHECK(rotary_mode == 1 || rotary_mode == 2)
+      << "Compressor split path supports HALF(1) or INTERLEAVE(2) rotary mode";
+  const int64_t row_count = input.size(0);
+  CHECK_EQ(cos.numel(), row_count * rope_head_dim);
+  CHECK_EQ(sin.numel(), row_count * rope_head_dim);
+
+  torch::Tensor input_4d = input.view({row_count, 1, 1, input.size(1)});
+  xllm::kernel::NpuInplacePartialRotaryMulParams rope_params;
+  rope_params.x = input_4d;
+  rope_params.r1 =
+      cos.to(torch::kFloat32).view({row_count, 1, 1, rope_head_dim});
+  rope_params.r2 =
+      sin.to(torch::kFloat32).view({row_count, 1, 1, rope_head_dim});
+  rope_params.rotary_mode = rotary_mode == 1 ? "half" : "interleave";
+  rope_params.partial_slice = {input.size(1) - rope_head_dim, input.size(1)};
+  xllm::kernel::npu_inplace_partial_rotary_mul(rope_params);
+  input = input_4d.view({row_count, input.size(1)});
+}
+
 }  // namespace
 
 CompressorImpl::CompressorImpl(int64_t compress_ratio, int64_t head_dim)
@@ -111,16 +138,7 @@ torch::Tensor CompressorImpl::forward(
     torch::Tensor& compressed_sin,
     torch::Tensor& compressed_cos,
     torch::Tensor actual_seq_lengths_query) {
-  CHECK(cmp_wkv_loaded_ && cmp_wgate_loaded_ && cmp_norm_loaded_ &&
-        cmp_ape_loaded_)
-      << "Compressor weights are incomplete before forward, prefix="
-      << (last_load_prefix_.empty() ? "<unknown>" : last_load_prefix_)
-      << ", loaded={wkv:" << (cmp_wkv_loaded_ ? "true" : "false")
-      << ", wgate:" << (cmp_wgate_loaded_ ? "true" : "false")
-      << ", norm:" << (cmp_norm_loaded_ ? "true" : "false")
-      << ", ape:" << (cmp_ape_loaded_ ? "true" : "false")
-      << "}. This usually means weights were not found across state_dict "
-         "shards.";
+  check_weights_loaded();
 
   auto [kv_state, score_state] = kv_states;
   auto [kv_block_table, score_block_table] = block_tables;
@@ -155,6 +173,88 @@ torch::Tensor CompressorImpl::forward(
   std::tie(compressed_kv, std::ignore, std::ignore, std::ignore, std::ignore) =
       xllm::kernel::compressor(params);
   return compressed_kv;
+}
+
+torch::Tensor CompressorImpl::project(
+    const torch::Tensor& hidden_states) const {
+  check_weights_loaded();
+  CHECK(has_split_operator())
+      << "DeepSeek V4 CP requires CompressorProjection and CompressorCore";
+  xllm::kernel::CompressorProjectionParams params;
+  params.x = hidden_states;
+  params.wkv = cmp_wkv_;
+  params.wgate = cmp_wgate_;
+  params.coff = enable_compressor_overlap_ ? 2 : 1;
+  return xllm::kernel::compressor_projection(params);
+}
+
+torch::Tensor CompressorImpl::forward_core(
+    const DSAMetadata& attn_metadata,
+    const torch::Tensor& packed_projection,
+    std::tuple<torch::Tensor, torch::Tensor>& kv_states,
+    std::tuple<torch::Tensor, torch::Tensor>& block_tables,
+    const torch::Tensor& compressed_sin,
+    const torch::Tensor& compressed_cos,
+    const torch::Tensor& actual_seq_lengths_query) const {
+  check_weights_loaded();
+  CHECK(has_split_operator())
+      << "DeepSeek V4 CP requires CompressorProjection and CompressorCore";
+  CHECK_EQ(actual_seq_lengths_query.dim(), 1);
+  CHECK_GE(actual_seq_lengths_query.numel(), 1);
+  CHECK_EQ(compressed_sin.numel(), compressed_cos.numel());
+  CHECK_EQ(compressed_sin.numel() % rope_head_dim_, 0);
+
+  torch::Tensor cu_seqlens = actual_seq_lengths_query.contiguous();
+  const int64_t sequence_count = cu_seqlens.numel() - 1;
+  torch::Tensor seqused = (cu_seqlens.slice(0, 1, sequence_count + 1) -
+                           cu_seqlens.slice(0, 0, sequence_count))
+                              .contiguous();
+  auto [kv_state, score_state] = kv_states;
+  auto [kv_block_table, score_block_table] = block_tables;
+  const int64_t output_row_count = compressed_sin.numel() / rope_head_dim_;
+
+  xllm::kernel::CompressorCoreParams params;
+  params.packed_projection = packed_projection;
+  params.kv_state = kv_state;
+  params.score_state = score_state;
+  params.ape = cmp_ape_;
+  params.kv_block_table = kv_block_table;
+  params.score_block_table = score_block_table;
+  params.cu_seqlens = cu_seqlens;
+  params.seqused = seqused;
+  params.start_pos = attn_metadata.start_pos.contiguous();
+  params.output_row_count = output_row_count;
+  params.cmp_ratio = compress_ratio_;
+  params.coff = enable_compressor_overlap_ ? 2 : 1;
+  torch::Tensor pre_norm = xllm::kernel::compressor_core(params);
+
+  xllm::kernel::FusedLayerNormParams norm_params;
+  norm_params.input = pre_norm;
+  norm_params.weight = cmp_norm_fp32_;
+  norm_params.eps = eps_;
+  norm_params.mode = "rmsnorm";
+  xllm::kernel::fused_layernorm(norm_params);
+  torch::Tensor normalized = norm_params.output;
+  apply_compressor_rope(
+      normalized, rope_head_dim_, rot_mode_, compressed_cos, compressed_sin);
+  return normalized.to(cmp_norm_.scalar_type());
+}
+
+bool CompressorImpl::has_split_operator() const {
+  return xllm::kernel::has_split_compressor();
+}
+
+void CompressorImpl::check_weights_loaded() const {
+  CHECK(cmp_wkv_loaded_ && cmp_wgate_loaded_ && cmp_norm_loaded_ &&
+        cmp_ape_loaded_)
+      << "Compressor weights are incomplete before forward, prefix="
+      << (last_load_prefix_.empty() ? "<unknown>" : last_load_prefix_)
+      << ", loaded={wkv:" << (cmp_wkv_loaded_ ? "true" : "false")
+      << ", wgate:" << (cmp_wgate_loaded_ ? "true" : "false")
+      << ", norm:" << (cmp_norm_loaded_ ? "true" : "false")
+      << ", ape:" << (cmp_ape_loaded_ ? "true" : "false")
+      << "}. This usually means weights were not found across state_dict "
+         "shards.";
 }
 
 void CompressorImpl::load_state_dict(const StateDict& state_dict) {
@@ -212,6 +312,7 @@ void CompressorImpl::load_state_dict(const StateDict& state_dict) {
   }
   if (norm.defined()) {
     cmp_norm_ = norm.to(options_);
+    cmp_norm_fp32_ = norm.to(options_.dtype(torch::kFloat32));
     cmp_norm_loaded_ = true;
   }
   if (ape.defined()) {
@@ -251,7 +352,8 @@ void CompressorImpl::load_state_dict(const StateDict& state_dict) {
 
 int64_t CompressorImpl::weight_bytes() const {
   return tensor_bytes(cmp_wkv_) + tensor_bytes(cmp_wgate_) +
-         tensor_bytes(cmp_norm_) + tensor_bytes(cmp_ape_);
+         tensor_bytes(cmp_norm_) + tensor_bytes(cmp_norm_fp32_) +
+         tensor_bytes(cmp_ape_);
 }
 
 }  // namespace layer

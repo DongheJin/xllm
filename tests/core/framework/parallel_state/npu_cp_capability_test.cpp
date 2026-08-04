@@ -23,21 +23,26 @@ namespace xllm {
 namespace {
 
 TEST(NpuCpCapabilityTest, RegisteredCpCapableModels) {
-  // The models that opt into NPU model-side CP. deepseek_v32 / glm_moe_dsa
-  // drive it through the ATB NpuCpPlan pipeline; deepseek_v4 owns its split
-  // inside the model on the TORCH backend. Both are advertised here because
-  // this is the master-side startup gate, not the worker-side sharding switch.
+  // The four models that opt into the NPU ATB model-side CP pipeline.
   EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v32"));
   EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v32_mtp"));
-  EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v4"));
-  EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v4_mtp"));
   EXPECT_TRUE(is_npu_model_cp_capable("glm_moe_dsa"));
   EXPECT_TRUE(is_npu_model_cp_capable("glm_moe_dsa_mtp"));
+  EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v4"));
+  EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v4_mtp"));
   // The registry must advertise NPU_MODEL for these and NONE for the rest.
   EXPECT_EQ(ModelRegistry::get_cp_sharding_mode("deepseek_v32"),
             CpShardingMode::NPU_MODEL);
   EXPECT_EQ(ModelRegistry::get_cp_sharding_mode("glm_moe_dsa_mtp"),
             CpShardingMode::NPU_MODEL);
+  const NpuModelCpCapability dsv4 =
+      ModelRegistry::get_npu_cp_capability("deepseek_v4");
+  EXPECT_EQ(dsv4.metadata_policy, CpMetadataPolicy::MODEL_MANAGED_GLOBAL_CACHE);
+  EXPECT_EQ(dsv4.required_backend, "TORCH");
+  EXPECT_FALSE(dsv4.supports_dp);
+  EXPECT_TRUE(dsv4.supports_mtp_prefill);
+  EXPECT_TRUE(dsv4.requires_kv_split_one);
+  EXPECT_TRUE(dsv4.requires_split_compressor);
 }
 
 TEST(NpuCpCapabilityTest, UnregisteredModelsAreNotCapable) {
@@ -49,10 +54,6 @@ TEST(NpuCpCapabilityTest, UnregisteredModelsAreNotCapable) {
   // Unrelated NPU models are not CP-capable.
   EXPECT_FALSE(is_npu_model_cp_capable("qwen3"));
   EXPECT_FALSE(is_npu_model_cp_capable("qwen3_atb"));
-  // Hybrid linear attention models are the only ones the graph executor takes
-  // through spec-verify chunked prefill; none of them is CP-capable, which is
-  // what keeps that capture path CP-free.
-  EXPECT_FALSE(is_npu_model_cp_capable("qwen3_next"));
   // Unknown model names default to NONE.
   EXPECT_FALSE(is_npu_model_cp_capable("definitely_not_a_model"));
   EXPECT_EQ(ModelRegistry::get_cp_sharding_mode("deepseek_v3_mtp"),

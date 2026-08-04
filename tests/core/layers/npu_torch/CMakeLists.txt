@@ -2,10 +2,25 @@ include(cc_test)
 
 cc_test(
   NAME
-    deepseek_v4_eplb_load_utils_test
+    deepseek_v4_cp_execution_test
   SRCS
-    deepseek_v4_eplb_load_utils_test.cpp
+    deepseek_v4_cp_execution_test.cpp
   DEPS
+    :npu_torch_layers
+    :parallel_state
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v4_cp_metadata_test
+  SRCS
+    deepseek_v4_cp_metadata_test.cpp
+  DEPS
+    :npu_torch_layers
+    :parallel_state
     glog::glog
     torch
     GTest::gtest_main
@@ -34,31 +49,6 @@ target_link_libraries(npu_deepseek_v4_indexer_test
                       atb)
 
 target_link_options(npu_deepseek_v4_indexer_test PRIVATE
-  "-Wl,--whole-archive"
-  "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
-  "-Wl,--no-whole-archive")
-
-cc_test(
-  NAME
-    deepseek_v4_eplb_test
-  SRCS
-    deepseek_v4_eplb_test.cpp
-  DEPS
-    :npu_torch_layers
-    glog::glog
-    torch
-    GTest::gtest_main
-)
-
-target_link_libraries(deepseek_v4_eplb_test
-                      PRIVATE
-                      ascendcl
-                      hccl
-                      c_sec
-                      nnopbase
-                      atb)
-
-target_link_options(deepseek_v4_eplb_test PRIVATE
   "-Wl,--whole-archive"
   "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
   "-Wl,--no-whole-archive")

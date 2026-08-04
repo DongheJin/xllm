@@ -226,6 +226,12 @@ std::tuple<torch::Tensor,
            torch::Tensor>
 compressor(CompressorParams& params);
 
+torch::Tensor compressor_projection(CompressorProjectionParams& params);
+
+torch::Tensor compressor_core(CompressorCoreParams& params);
+
+bool has_split_compressor();
+
 torch::Tensor quant_lightning_indexer_metadata(
     QuantLightningIndexerMetadataParams& params);
 
