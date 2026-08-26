@@ -240,6 +240,75 @@ torch::Tensor CompressorImpl::forward_core(
   return normalized.to(cmp_norm_.scalar_type());
 }
 
+torch::Tensor CompressorImpl::forward_owner_core(
+    const Dsv4CpOwnerMetadata& owner_metadata,
+    const torch::Tensor& owner_packed_projection,
+    std::tuple<torch::Tensor, torch::Tensor>& owner_states,
+    std::tuple<torch::Tensor, torch::Tensor>& owner_block_tables,
+    const torch::Tensor& compressed_sin,
+    const torch::Tensor& compressed_cos) const {
+  CHECK(owner_packed_projection.defined());
+  CHECK_EQ(owner_packed_projection.dim(), 2);
+  CHECK(owner_packed_projection.is_contiguous());
+  CHECK_EQ(owner_packed_projection.size(0), owner_metadata.real_row_count);
+  CHECK_EQ(owner_packed_projection.size(1),
+           2 * (enable_compressor_overlap_ ? 2 : 1) * head_dim_);
+  CHECK_EQ(owner_metadata.q_cu_seq_lens.numel(),
+           owner_metadata.segment_count + 1);
+  CHECK_EQ(owner_metadata.start_positions.numel(),
+           owner_metadata.segment_count);
+  CHECK_EQ(owner_metadata.local_state_block_table.size(0),
+           owner_metadata.segment_count);
+  CHECK_EQ(compressed_sin.numel(), compressed_cos.numel());
+  CHECK_EQ(compressed_sin.numel(),
+           owner_metadata.output_row_count * rope_head_dim_);
+
+  auto [kv_block_table, score_block_table] = owner_block_tables;
+  CHECK_EQ(kv_block_table.sizes(),
+           owner_metadata.local_state_block_table.sizes());
+  CHECK_EQ(score_block_table.sizes(),
+           owner_metadata.local_state_block_table.sizes());
+
+  DSAMetadata owner_attention_metadata;
+  owner_attention_metadata.start_pos = owner_metadata.start_positions;
+  return forward_core(owner_attention_metadata,
+                      owner_packed_projection,
+                      owner_states,
+                      owner_block_tables,
+                      compressed_sin,
+                      compressed_cos,
+                      owner_metadata.q_cu_seq_lens);
+}
+
+torch::Tensor CompressorImpl::forward_owner_decode(
+    const Dsv4CpOwnerMetadata& owner_metadata,
+    torch::Tensor& owner_hidden_states,
+    std::tuple<torch::Tensor, torch::Tensor>& owner_states,
+    std::tuple<torch::Tensor, torch::Tensor>& owner_block_tables,
+    torch::Tensor& compressed_sin,
+    torch::Tensor& compressed_cos) {
+  CHECK(owner_hidden_states.defined());
+  CHECK_EQ(owner_hidden_states.dim(), 2);
+  CHECK_EQ(owner_hidden_states.size(0), owner_metadata.real_row_count);
+  CHECK_EQ(owner_metadata.q_cu_seq_lens.numel(),
+           owner_metadata.segment_count + 1);
+  CHECK_EQ(owner_metadata.start_positions.numel(),
+           owner_metadata.segment_count);
+  CHECK_EQ(compressed_sin.numel(),
+           owner_metadata.output_row_count * rope_head_dim_);
+  CHECK_EQ(compressed_cos.numel(), compressed_sin.numel());
+
+  DSAMetadata owner_attention_metadata;
+  owner_attention_metadata.start_pos = owner_metadata.start_positions;
+  return forward(owner_attention_metadata,
+                 owner_hidden_states,
+                 owner_states,
+                 owner_block_tables,
+                 compressed_sin,
+                 compressed_cos,
+                 owner_metadata.q_cu_seq_lens);
+}
+
 bool CompressorImpl::has_split_operator() const {
   return xllm::kernel::has_split_compressor();
 }

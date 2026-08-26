@@ -55,12 +55,13 @@ int64_t checked_sum(const std::vector<int64_t>& values, const char* name) {
 
 int64_t projection_gather_bytes(int64_t global_token_count,
                                 int64_t gathered_token_count,
-                                int64_t projection_width) {
+                                int64_t projection_width,
+                                int64_t dtype_size) {
   const int64_t global_bytes =
-      checked_product({global_token_count, projection_width, /*FP32=*/4},
+      checked_product({global_token_count, projection_width, dtype_size},
                       "global projection gather bytes");
   const int64_t gathered_bytes =
-      checked_product({gathered_token_count, projection_width, /*FP32=*/4},
+      checked_product({gathered_token_count, projection_width, dtype_size},
                       "padded projection gather bytes");
   return std::max(
       checked_product({/*stacked and concatenated=*/2, gathered_bytes},
@@ -98,6 +99,7 @@ Dsv4CpMemoryBudget Dsv4CpMemoryBudgetEstimator::estimate(
   CHECK_GT(config.cp_size, 1);
   CHECK_GT(config.model_dtype_size, 0);
   CHECK_GE(config.collective_workspace_bytes, 0);
+  CHECK_GE(config.moe_operator_workspace_bytes, 0);
 
   const int64_t gathered_padded_token_count =
       checked_product({config.cp_size, config.local_padded_token_count},
@@ -109,12 +111,12 @@ Dsv4CpMemoryBudget Dsv4CpMemoryBudgetEstimator::estimate(
   global_projection_bytes.reserve(config.projection_widths.size());
   for (int64_t width : config.projection_widths) {
     CHECK_GT(width, 0) << "DSV4 CP projection width must be positive";
-    local_projection_bytes.emplace_back(
-        checked_product({config.local_padded_token_count, width, /*FP32=*/4},
-                        "local projection bytes"));
-    global_projection_bytes.emplace_back(
-        checked_product({config.global_real_token_count, width, /*FP32=*/4},
-                        "global projection bytes"));
+    local_projection_bytes.emplace_back(checked_product(
+        {config.local_padded_token_count, width, config.model_dtype_size},
+        "local projection bytes"));
+    global_projection_bytes.emplace_back(checked_product(
+        {config.global_real_token_count, width, config.model_dtype_size},
+        "global projection bytes"));
   }
 
   Dsv4CpMemoryBudget budget;
@@ -133,7 +135,8 @@ Dsv4CpMemoryBudget Dsv4CpMemoryBudgetEstimator::estimate(
           checked_sum({budget.local_projection_bytes,
                        projection_gather_bytes(config.global_real_token_count,
                                                gathered_padded_token_count,
-                                               bundled_width)},
+                                               bundled_width,
+                                               config.model_dtype_size)},
                       "bundled projection gather bytes");
     }
   } else {
@@ -156,7 +159,8 @@ Dsv4CpMemoryBudget Dsv4CpMemoryBudgetEstimator::estimate(
       budget.projection_gather_bytes =
           projection_gather_bytes(config.global_real_token_count,
                                   gathered_padded_token_count,
-                                  largest_width);
+                                  largest_width,
+                                  config.model_dtype_size);
     }
   }
 
@@ -183,12 +187,14 @@ Dsv4CpMemoryBudget Dsv4CpMemoryBudgetEstimator::estimate(
                     "MoE bridge bytes");
   }
   budget.collective_workspace_bytes = config.collective_workspace_bytes;
+  budget.moe_operator_workspace_bytes = config.moe_operator_workspace_bytes;
   budget.peak_transient_bytes = checked_sum({budget.local_projection_bytes,
                                              budget.projection_gather_bytes,
                                              budget.global_projection_bytes,
                                              budget.swa_gather_bytes,
                                              budget.moe_bridge_bytes,
-                                             budget.collective_workspace_bytes},
+                                             budget.collective_workspace_bytes,
+                                             budget.moe_operator_workspace_bytes},
                                             "DSV4 CP peak transient bytes");
   budget.required_bytes =
       checked_sum({budget.persistent_cache_bytes, budget.peak_transient_bytes},

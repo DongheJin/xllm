@@ -101,10 +101,10 @@ TEST_F(DeepseekV4IndexerTest, DsaTokenSlotsTrackCurrentDecodeStep) {
   ASSERT_EQ(dsa.slot_mappings[0].size(), 2);
 
   const auto token_slots = dsa.slot_mappings[0][0];
-  const auto expected_slots = torch::tensor({129}, torch::kInt32);
+  const auto expected_slots = torch::tensor({129, -1}, torch::kInt32);
   EXPECT_TRUE(torch::equal(token_slots, expected_slots))
-      << "token slots should include only current-step committed compressed "
-         "slots";
+      << "token slots should contain only current-step committed compressed "
+         "slots followed by padding sentinels";
 }
 
 TEST_F(DeepseekV4IndexerTest, DsaSwaBlockTableUsesLogicalColumnsWithoutWrap) {
@@ -169,6 +169,66 @@ TEST_F(DeepseekV4IndexerTest, DsaDummyAttentionUsesPositionDevice) {
   EXPECT_EQ(metadata.slot_mapping.device(), positions.device());
   EXPECT_TRUE(torch::equal(metadata.q_seq_lens.cpu(),
                            torch::tensor({1}, torch::kInt32)));
+}
+
+TEST_F(DeepseekV4IndexerTest, ScoresQuantizedOwnerCandidatesByBlockTable) {
+  const torch::Tensor quantized_query =
+      torch::tensor({{{1, 2}, {3, 4}}, {{2, 0}, {0, 2}}}, torch::kInt8);
+  const torch::Tensor query_scale =
+      torch::tensor({{2.0f, 1.0f}, {1.0f, 1.0f}}, torch::kFloat16);
+  const torch::Tensor weights =
+      torch::tensor({{1.0f, 0.5f}, {1.0f, 1.0f}}, torch::kFloat16);
+  const torch::Tensor key_cache =
+      torch::tensor({{{{1, 0}}}, {{{0, 1}}}, {{{1, 1}}}, {{{2, 1}}}},
+                    torch::kInt8)
+          .reshape({2, 2, 1, 2});
+  const torch::Tensor key_scale =
+      torch::tensor({1.0f, 2.0f, 0.5f, 1.0f}, torch::kFloat16)
+          .reshape({2, 2, 1});
+  const torch::Tensor candidate_indices =
+      torch::tensor({{{0, 3}}, {{-1, 2}}}, torch::kInt32);
+  const torch::Tensor block_table =
+      torch::tensor({{1, 0}, {0, 1}}, torch::kInt32);
+
+  const torch::Tensor scores =
+      DeepseekV4IndexerImpl::score_quantized_qli_candidates(quantized_query,
+                                                            query_scale,
+                                                            weights,
+                                                            key_cache,
+                                                            key_scale,
+                                                            candidate_indices,
+                                                            block_table);
+
+  EXPECT_EQ(scores.scalar_type(), torch::kFloat32);
+  EXPECT_NEAR(scores[0][0][0].item<float>(), 4.75f / 1024.0f, 1e-7f);
+  EXPECT_NEAR(scores[0][0][1].item<float>(), 12.0f / 1024.0f, 1e-7f);
+  EXPECT_TRUE(torch::isneginf(scores[1][0][0]).item<bool>());
+  EXPECT_NEAR(scores[1][0][1].item<float>(), 2.0f / 1024.0f, 1e-7f);
+}
+
+TEST_F(DeepseekV4IndexerTest, ScoresCandidatesWithPerHeadReluBeforeReduction) {
+  const torch::Tensor quantized_query =
+      torch::tensor({{{1, 0}, {-1, 0}}}, torch::kInt8);
+  const torch::Tensor query_scale = torch::ones({1, 2}, torch::kFloat16);
+  const torch::Tensor weights = torch::ones({1, 2}, torch::kFloat16);
+  const torch::Tensor key_cache =
+      torch::tensor({{{{1, 0}}}, {{{0, 1}}}}, torch::kInt8);
+  const torch::Tensor key_scale = torch::ones({2, 1, 1}, torch::kFloat16);
+  const torch::Tensor candidate_indices =
+      torch::tensor({{{0, 1}}}, torch::kInt32);
+  const torch::Tensor block_table = torch::tensor({{0, 1}}, torch::kInt32);
+
+  const torch::Tensor scores =
+      DeepseekV4IndexerImpl::score_quantized_qli_candidates(quantized_query,
+                                                            query_scale,
+                                                            weights,
+                                                            key_cache,
+                                                            key_scale,
+                                                            candidate_indices,
+                                                            block_table);
+
+  EXPECT_NEAR(scores[0][0][0].item<float>(), 1.0f / 1024.0f, 1e-7f);
+  EXPECT_FLOAT_EQ(scores[0][0][1].item<float>(), 0.0f);
 }
 
 }  // namespace layer

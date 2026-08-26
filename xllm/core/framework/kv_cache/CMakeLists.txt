@@ -11,6 +11,30 @@ cc_library(
 
 cc_library(
   NAME
+    deepseek_v4_cp_cache_layout
+  HDRS
+    deepseek_v4_cp_cache_layout.h
+  SRCS
+    deepseek_v4_cp_cache_layout.cpp
+  DEPS
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
+    deepseek_v4_cp_cache_migration
+  HDRS
+    deepseek_v4_cp_cache_migration.h
+  SRCS
+    deepseek_v4_cp_cache_migration.cpp
+  DEPS
+    :deepseek_v4_cp_cache_layout
+    glog::glog
+)
+
+cc_library(
+  NAME
     kv_cache_estimation
   HDRS
     kv_cache_capacity.h
@@ -20,6 +44,7 @@ cc_library(
   DEPS
     :common
     :deepseek_v4_cache_policy
+    :deepseek_v4_cp_cache_layout
     :block_utils
     :platform
     glog::glog
@@ -59,6 +84,7 @@ cc_library(
     :block_utils
     :common
     :deepseek_v4_cache_policy
+    :deepseek_v4_cp_cache_layout
     :kv_cache_estimation
     :xtensor
     glog::glog

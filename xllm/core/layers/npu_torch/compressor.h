@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "core/framework/state_dict/utils.h"
 #include "layers/common/attention_metadata.h"
+#include "layers/npu_torch/deepseek_v4_cp_ownership.h"
 
 namespace xllm {
 namespace layer {
@@ -63,6 +64,22 @@ class CompressorImpl : public torch::nn::Module {
       const torch::Tensor& compressed_sin,
       const torch::Tensor& compressed_cos,
       const torch::Tensor& actual_seq_lengths_query) const;
+
+  torch::Tensor forward_owner_core(
+      const Dsv4CpOwnerMetadata& owner_metadata,
+      const torch::Tensor& owner_packed_projection,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_states,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_block_tables,
+      const torch::Tensor& compressed_sin,
+      const torch::Tensor& compressed_cos) const;
+
+  torch::Tensor forward_owner_decode(
+      const Dsv4CpOwnerMetadata& owner_metadata,
+      torch::Tensor& owner_hidden_states,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_states,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_block_tables,
+      torch::Tensor& compressed_sin,
+      torch::Tensor& compressed_cos);
 
   bool has_split_operator() const;
 

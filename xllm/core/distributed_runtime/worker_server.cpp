@@ -322,6 +322,9 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
   const std::string& indexer_cache_dtype =
       KVCacheConfig::get_instance().indexer_cache_dtype();
   const char* indexer_cache_dtype_ptr = indexer_cache_dtype.c_str();
+  const std::string& dsv4_compress_state_dtype =
+      KVCacheConfig::get_instance().dsv4_compress_state_dtype();
+  const char* dsv4_compress_state_dtype_ptr = dsv4_compress_state_dtype.c_str();
   std::string enable_mtp_draft_body_tp1_str =
       std::to_string(options.enable_mtp_draft_body_tp1());
   const char* enable_mtp_draft_body_tp1_ptr =
@@ -377,6 +380,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
                         indexer_cache_dtype_ptr,
                         enable_mtp_draft_body_tp1_ptr,
                         text_encoder_tp_size_ptr,
+                        dsv4_compress_state_dtype_ptr,
                         nullptr};
   static_assert(std::size(argv) == spawn_worker_protocol::kArgumentCount + 1);
   pid_t pid;

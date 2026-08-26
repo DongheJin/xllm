@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/block/block.h"
 #include "core/framework/block/block_manager_impl.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/kv_cache/kv_cache_utils.h"
@@ -36,6 +37,7 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
 #include "core/framework/model_loader.h"
+#include "core/framework/parallel_state/npu_cp_plan.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -777,6 +779,40 @@ TEST_F(AclGraphExecutorTest, DecodeBatchSizeThresholdFallsBackToEager) {
                               /*atol=*/1e-6));
 }
 
+TEST_F(AclGraphExecutorTest, DeepseekV4CpDecodeFallsBackToEager) {
+  auto batch = CreateTestBatch();
+  ASSERT_FALSE(batch->empty());
+  ForwardInput forward_input = batch->prepare_forward_input(
+      options_.num_decoding_tokens(),
+      /*min_decoding_batch_size=*/0,
+      model_args_);
+  forward_input = forward_input.to(*device_, torch::kFloat32);
+
+  model_args_.model_type("deepseek_v4");
+  options_.cp_size(8);
+  const ModelOutput eager_output = model_->forward(
+      {forward_input.token_ids},
+      {forward_input.positions},
+      kv_caches_,
+      {forward_input.input_params});
+  auto graph_executor = std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+  const double eager_fallbacks_before =
+      COUNTER_num_model_execution_total_eager.get_value();
+  const ModelOutput actual_output = graph_executor->run(
+      {forward_input.token_ids},
+      {forward_input.positions},
+      kv_caches_,
+      {forward_input.input_params});
+
+  EXPECT_EQ(COUNTER_num_model_execution_total_eager.get_value(),
+            eager_fallbacks_before + 1);
+  EXPECT_TRUE(torch::allclose(eager_output.hidden_states,
+                              actual_output.hidden_states,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+}
+
 // Test ACL graph executor against original NPU executor implementation
 TEST_F(AclGraphExecutorTest, AclGraphExecutorVsBaseExecutorImpl) {
   // Create test batch
@@ -957,6 +993,69 @@ TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
 
   execution_config.enable_graph_double_buffer(
       original_enable_graph_double_buffer);
+}
+
+TEST_F(AclGraphExecutorTest, Dsv4CompressorStateDtypeIsPartOfGraphKey) {
+  KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
+  const std::string original_state_dtype =
+      kv_cache_config.dsv4_compress_state_dtype();
+  const std::string original_model_type = model_args_.model_type();
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+
+  model_args_.model_type("deepseek_v4");
+  auto dsv4_executor = std::make_unique<npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+  kv_cache_config.dsv4_compress_state_dtype("float32");
+  const uint64_t fp32_key = dsv4_executor->graph_key_for_test(8, params);
+  kv_cache_config.dsv4_compress_state_dtype("bfloat16");
+  const uint64_t bf16_key = dsv4_executor->graph_key_for_test(8, params);
+  EXPECT_NE(fp32_key, bf16_key);
+
+  model_args_.model_type("test_model");
+  auto non_dsv4_executor = std::make_unique<npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+  kv_cache_config.dsv4_compress_state_dtype("float32");
+  const uint64_t non_dsv4_fp32_key =
+      non_dsv4_executor->graph_key_for_test(8, params);
+  kv_cache_config.dsv4_compress_state_dtype("bfloat16");
+  const uint64_t non_dsv4_bf16_key =
+      non_dsv4_executor->graph_key_for_test(8, params);
+  EXPECT_EQ(non_dsv4_fp32_key, non_dsv4_bf16_key);
+
+  kv_cache_config.dsv4_compress_state_dtype(original_state_dtype);
+  model_args_.model_type(original_model_type);
+}
+
+TEST_F(AclGraphExecutorTest, CpLayoutAndRankArePartOfGraphKey) {
+  CpPlanInput input;
+  input.q_seq_lens = {8};
+  input.position_ids = torch::arange(8, torch::kInt32);
+
+  CpPlanConfig rank_zero_config;
+  rank_zero_config.cp_size = 2;
+  rank_zero_config.cp_rank = 0;
+  rank_zero_config.kv_split_size = 1;
+  rank_zero_config.kv_split_rank = 0;
+  rank_zero_config.block_size = 4;
+  rank_zero_config.projection_gather_mode = CpProjectionGatherMode::BUNDLED;
+
+  CpPlanConfig rank_one_config = rank_zero_config;
+  rank_one_config.cp_rank = 1;
+  ModelInputParams rank_zero_params;
+  rank_zero_params.parallel.cp_plan = NpuCpPlan::build(input, rank_zero_config);
+  ModelInputParams rank_one_params;
+  rank_one_params.parallel.cp_plan = NpuCpPlan::build(input, rank_one_config);
+
+  const uint64_t rank_zero_key =
+      std::make_unique<npu::AclGraphExecutorImpl>(
+          model_.get(), model_args_, *device_, options_)
+          ->graph_key_for_test(8, rank_zero_params);
+  const uint64_t rank_one_key =
+      std::make_unique<npu::AclGraphExecutorImpl>(
+          model_.get(), model_args_, *device_, options_)
+          ->graph_key_for_test(8, rank_one_params);
+  EXPECT_NE(rank_zero_key, rank_one_key);
 }
 
 TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {

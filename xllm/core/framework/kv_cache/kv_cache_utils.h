@@ -89,6 +89,13 @@ struct KVCacheCreateOptions {
   PROPERTY(int64_t, index_head_dim) = 0;
   PROPERTY(int64_t, window_size) = 0;
   PROPERTY(std::vector<int32_t>, compress_ratios);
+  PROPERTY(torch::ScalarType, dsv4_compress_state_dtype) = torch::kFloat32;
+  // Owner-local DSV4 cache allocation is staged independently from the
+  // runtime owner path. Callers must opt in only after global block ids are
+  // translated through Dsv4CpCacheLayout before every cache access.
+  PROPERTY(bool, dsv4_cp_cache_sharding) = false;
+  PROPERTY(int32_t, dsv4_cp_size) = 1;
+  PROPERTY(int32_t, dsv4_cp_rank) = 0;
 };
 
 struct KVCacheTensors {

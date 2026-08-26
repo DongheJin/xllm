@@ -18,8 +18,52 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <optional>
+#include <string_view>
 
 namespace xllm {
+
+enum class Dsv4CompressStateDtype : int8_t {
+  FP32 = 0,
+  BF16 = 1,
+};
+
+struct Dsv4CompressorDtypePolicy {
+  torch::ScalarType projection_storage_dtype = torch::kBFloat16;
+  torch::ScalarType state_storage_dtype = torch::kFloat32;
+  torch::ScalarType compute_dtype = torch::kFloat32;
+};
+
+inline std::optional<Dsv4CompressStateDtype>
+parse_dsv4_compress_state_dtype(std::string_view value) {
+  if (value == "float32" || value == "fp32") {
+    return Dsv4CompressStateDtype::FP32;
+  }
+  if (value == "bfloat16" || value == "bf16") {
+    return Dsv4CompressStateDtype::BF16;
+  }
+  return std::nullopt;
+}
+
+inline torch::ScalarType dsv4_compress_state_torch_dtype(
+    Dsv4CompressStateDtype dtype) {
+  return dtype == Dsv4CompressStateDtype::BF16 ? torch::kBFloat16
+                                                : torch::kFloat32;
+}
+
+inline std::string_view dsv4_compress_state_dtype_name(
+    Dsv4CompressStateDtype dtype) {
+  return dtype == Dsv4CompressStateDtype::BF16 ? "bfloat16" : "float32";
+}
+
+inline Dsv4CompressorDtypePolicy get_dsv4_compressor_dtype_policy(
+    torch::ScalarType model_dtype,
+    Dsv4CompressStateDtype state_dtype) {
+  Dsv4CompressorDtypePolicy policy;
+  policy.projection_storage_dtype = model_dtype;
+  policy.state_storage_dtype = dsv4_compress_state_torch_dtype(state_dtype);
+  return policy;
+}
 
 struct DeepSeekV4CachePolicy {
   torch::ScalarType index_dtype = torch::kInt8;

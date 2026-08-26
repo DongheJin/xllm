@@ -745,6 +745,7 @@ class DeepseekV4ModelImpl
       }
     }
 
+    const int32_t fc1_global_num_tokens = static_cast<int32_t>(h.size(0));
     const NpuCpPlan& cp_plan = modified_input_params.parallel.cp_plan;
     std::optional<layer::Dsv4CpMetadata> cp_metadata;
     torch::Tensor layer_tokens = tokens;
@@ -766,15 +767,22 @@ class DeepseekV4ModelImpl
           cp_plan, cp_metadata_config, runtime_device, cp_inputs);
     }
 
-    const int32_t fc1_num_tokens = static_cast<int32_t>(h.size(0));
+    FlashComm1TokenGeometry fc1_geometry =
+        flash_comm1_token_geometry_without_cp(fc1_global_num_tokens);
+    if (cp_plan.enabled()) {
+      const CpRowLayout& row_layout = cp_plan.row_layout();
+      CHECK_EQ(row_layout.global_real_token_count(), fc1_global_num_tokens);
+      CHECK_EQ(row_layout.local_padded_token_count(), h.size(0));
+      fc1_geometry.local_num_tokens =
+          static_cast<int32_t>(row_layout.local_padded_token_count());
+      fc1_geometry.cp_has_empty_rank = row_layout.has_empty_rank();
+    }
     FlashComm1Context fc1_ctx;
-    if (!acl_graph_forward && !is_empty_dp_rank && !cp_plan.enabled()) {
+    if (!acl_graph_forward && !is_empty_dp_rank) {
       const bool is_prefill_side =
           input_params.meta.batch_forward_type.no_decode();
-      fc1_ctx = build_flash_comm1_context(fc1_num_tokens,
-                                          is_prefill_side,
-                                          parallel_args_,
-                                          flash_comm1_options_);
+      fc1_ctx = build_flash_comm1_context(
+          fc1_geometry, is_prefill_side, parallel_args_, flash_comm1_options_);
     }
     FlashComm1ContextScope fc1_scope(&fc1_ctx);
     if (is_sequence_sharded(fc1_ctx)) {

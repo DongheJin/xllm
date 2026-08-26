@@ -85,6 +85,27 @@ std::vector<int32_t> graph_decode_buckets(int32_t max_seqs_per_batch,
   return decode_buckets;
 }
 
+int32_t graph_decode_batch_capacity(
+    int32_t configured_max_batch_size,
+    const std::vector<size_t>& fresh_sequence_capacities) {
+  if (configured_max_batch_size <= 0 || fresh_sequence_capacities.empty()) {
+    return 0;
+  }
+
+  std::vector<size_t> assigned(fresh_sequence_capacities.size(), 0);
+  int32_t capacity = 0;
+  while (capacity < configured_max_batch_size) {
+    const size_t dp_rank =
+        static_cast<size_t>(capacity) % fresh_sequence_capacities.size();
+    if (assigned[dp_rank] >= fresh_sequence_capacities[dp_rank]) {
+      break;
+    }
+    ++assigned[dp_rank];
+    ++capacity;
+  }
+  return capacity;
+}
+
 std::string graph_warmup_progress(int32_t completed,
                                   int32_t total,
                                   int32_t bucket,

@@ -11,6 +11,8 @@ include(CMakeParseArguments)
 # COPTS: List of private compile options
 # LINKOPTS: List of link options
 # ARGS: Command line arguments to test case
+# NO_NPU_RUNTIME: Do not inject the ACL/torch_npu gtest environment into a
+#                  CPU-only test in an NPU build.
 #
 # Usage:
 # cc_library(
@@ -39,7 +41,7 @@ function(cc_test)
 
   cmake_parse_arguments(
     CC_TEST # prefix
-    "" # options
+    "NO_NPU_RUNTIME" # options
     "NAME;ENVIRONMENT" # one value args
     "SRCS;COPTS;LINKOPTS;DEPS;INCLUDES;ARGS;DATA" # multi value args
     ${ARGN}
@@ -112,7 +114,7 @@ function(cc_test)
     PRIVATE ${CC_TEST_LINKOPTS}
   )
 
-  if(USE_NPU)
+  if(USE_NPU AND NOT CC_TEST_NO_NPU_RUNTIME)
     target_sources(${CC_TEST_NAME} PRIVATE
       "${PROJECT_SOURCE_DIR}/tests/npu_test_environment.cpp"
     )

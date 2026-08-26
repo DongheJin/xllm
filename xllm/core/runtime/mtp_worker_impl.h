@@ -195,6 +195,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                 const torch::Tensor& base_kv_seq_lens,
                                 ForwardInput combined_input);
   bool pending_draft_context_matches(const ForwardInput& input) const;
+  Stream& mtp_prepare_stream();
 
  protected:
   // Draft model worker
@@ -219,6 +220,11 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // before control returns to the scheduler.  The following scheduler turn
   // consumes this output and only submits draft steps 1..N-1.
   PendingDraftContext pending_draft_context_;
+  // The scheduler prepares the next overlap step on WorkerImpl::prepare_stream_
+  // while the current MTP step is still enqueueing draft/validate metadata. A
+  // separate stream prevents the scheduler's compute-stream fence from
+  // blocking metadata that the same compute stream still needs.
+  std::unique_ptr<Stream> mtp_prepare_stream_;
   // Whether validation directly uses selected-only draft_probs [B, S].
   // If false, selected-only cache values are restored to dense [B, S, V].
   bool enable_opt_validate_probs_ = false;

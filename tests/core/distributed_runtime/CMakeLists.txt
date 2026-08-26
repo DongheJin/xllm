@@ -11,3 +11,13 @@ cc_test(
   DEPS
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    overlap_result_collection_test
+  SRCS
+    overlap_result_collection_test.cpp
+  DEPS
+    GTest::gtest_main
+  NO_NPU_RUNTIME
+)

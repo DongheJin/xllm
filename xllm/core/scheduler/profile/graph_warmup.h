@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -39,6 +40,10 @@ bool skip_graph_bucket(int32_t bucket, int32_t dp_size);
 
 std::vector<int32_t> graph_decode_buckets(int32_t max_seqs_per_batch,
                                           int32_t dp_size);
+
+int32_t graph_decode_batch_capacity(
+    int32_t configured_max_batch_size,
+    const std::vector<size_t>& fresh_sequence_capacities);
 
 std::string graph_warmup_progress(int32_t completed,
                                   int32_t total,

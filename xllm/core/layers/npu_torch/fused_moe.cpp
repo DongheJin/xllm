@@ -37,6 +37,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
 #include "layers/common/dp_utils.h"
+#include "layers/npu_torch/deepseek_v4_eplb_utils.h"
 #include "platform/device.h"
 #include "util/utils.h"
 
@@ -1336,7 +1337,13 @@ torch::Tensor FusedMoEImpl::forward_with_dispatch_ffn_combine(
   params.scale2 = torch::TensorList(scale2_list);
   params.probs = weights_2d;
   params.group = get_moe_ep_group_name();
-  params.max_output_size = 65536;
+  const int64_t ep_world_size = parallel_args_.moe_ep_group_->world_size();
+  params.max_output_size = dsv4_eplb::dispatch_ffn_max_output_size(
+      input_2d.size(0), topk_, ep_world_size);
+  CHECK_GT(params.max_output_size, 0)
+      << "Invalid DispatchFFNCombine output capacity: local_tokens="
+      << input_2d.size(0) << ", topk=" << topk_
+      << ", ep_world_size=" << ep_world_size;
   params.swiglu_limit = swiglu_limit_;
   params.output = torch::empty_like(input_2d);
   params.expert_token_nums = torch::empty(

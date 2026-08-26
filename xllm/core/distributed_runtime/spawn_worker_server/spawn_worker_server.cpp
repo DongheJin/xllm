@@ -65,6 +65,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
                                      int32_t num_decoding_tokens,
                                      int32_t block_size,
                                      const std::string& indexer_cache_dtype,
+                                     const std::string& dsv4_compress_state_dtype,
                                      int32_t max_tokens_per_batch,
                                      int32_t max_seqs_per_batch,
                                      bool enable_shm,
@@ -151,7 +152,8 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
   DistributedConfig::get_instance().master_node_addr(master_node_addr);
   KVCacheConfig::get_instance()
       .block_size(block_size)
-      .indexer_cache_dtype(indexer_cache_dtype);
+      .indexer_cache_dtype(indexer_cache_dtype)
+      .dsv4_compress_state_dtype(dsv4_compress_state_dtype);
   KVCacheConfig::get_instance().validate();
   EPLBConfig::get_instance().rank_tablefile(rank_tablefile);
 

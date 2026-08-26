@@ -39,6 +39,7 @@ struct Dsv4CpMemoryBudgetConfig {
   int64_t hidden_size = 0;
   int64_t model_dtype_size = 0;
   int64_t collective_workspace_bytes = 0;
+  int64_t moe_operator_workspace_bytes = 0;
   bool requires_moe_bridge = false;
   CpProjectionGatherMode gather_mode = CpProjectionGatherMode::BUNDLED;
 };
@@ -51,6 +52,7 @@ struct Dsv4CpMemoryBudget {
   int64_t swa_gather_bytes = 0;
   int64_t moe_bridge_bytes = 0;
   int64_t collective_workspace_bytes = 0;
+  int64_t moe_operator_workspace_bytes = 0;
   int64_t peak_transient_bytes = 0;
   int64_t required_bytes = 0;
 };

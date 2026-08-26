@@ -279,6 +279,25 @@ std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
     c10::string_view layout_kv,
     bool return_softmax_lse);
 
+// Owner-local DSV4 attention. Query and sparse-index tensors use TND layout;
+// PA_ND caches contain only the current CP rank's owned blocks.
+std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv_owner(
+    const at::Tensor& q,
+    const c10::optional<at::Tensor>& ori_kv,
+    const c10::optional<at::Tensor>& cmp_kv,
+    const c10::optional<at::Tensor>& ori_sparse_indices,
+    const c10::optional<at::Tensor>& cmp_sparse_indices,
+    const c10::optional<at::Tensor>& ori_block_table,
+    const c10::optional<at::Tensor>& cmp_block_table,
+    const c10::optional<at::Tensor>& cu_seqlens_q,
+    const c10::optional<at::Tensor>& seqused_kv,
+    const c10::optional<at::Tensor>& sinks,
+    int64_t ori_topk,
+    int64_t cmp_topk,
+    int64_t cmp_ratio,
+    double softmax_scale,
+    int64_t ori_win_left);
+
 at::Tensor sparse_flash_attention(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -375,6 +394,8 @@ torch::Tensor compressor_core(const torch::Tensor& packed_projection,
                               int64_t coff);
 
 bool has_split_compressor();
+
+bool has_owner_sparse_attention();
 
 at::Tensor quant_lightning_indexer_metadata(
     int64_t num_heads_q,

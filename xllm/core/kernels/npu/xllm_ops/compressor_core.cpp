@@ -59,10 +59,14 @@ torch::Tensor compressor_core(const torch::Tensor& packed_projection,
       << "CompressorCore expects 2-D packed_projection";
   CHECK(packed_projection.is_contiguous())
       << "CompressorCore expects contiguous packed_projection";
-  CHECK_EQ(packed_projection.scalar_type(), torch::kFloat32)
-      << "CompressorCore expects FP32 packed_projection";
-  CHECK_EQ(kv_state.scalar_type(), torch::kFloat32);
-  CHECK_EQ(score_state.scalar_type(), torch::kFloat32);
+  CHECK(packed_projection.scalar_type() == torch::kFloat16 ||
+        packed_projection.scalar_type() == torch::kBFloat16)
+      << "CompressorCore expects FP16 or BF16 packed_projection";
+  CHECK(kv_state.scalar_type() == torch::kFloat32 ||
+        kv_state.scalar_type() == torch::kBFloat16)
+      << "CompressorCore expects FP32 or BF16 kv_state";
+  CHECK_EQ(score_state.scalar_type(), kv_state.scalar_type())
+      << "CompressorCore state tensors must use the same dtype";
   CHECK_EQ(ape.scalar_type(), torch::kFloat32);
   CHECK_GE(kv_state.dim(), 1);
   CHECK_GE(score_state.dim(), 1);

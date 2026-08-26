@@ -20,11 +20,13 @@ limitations under the License.
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/kv_cache_config.h"
 #include "framework/block/block.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
+#include "framework/kv_cache/deepseek_v4_cp_cache_layout.h"
 #include "framework/kv_cache/deepseek_v4_kv_cache_impl.h"
 #include "framework/kv_cache/kv_cache_tensor_allocator.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -51,6 +53,16 @@ std::vector<int64_t> dsv4_block_shape(int64_t block_count,
 #else
   return {block_count, block_size, n_heads, head_dim};
 #endif
+}
+
+int64_t cache_tensor_bytes(const std::vector<KVCache>& caches) {
+  int64_t bytes = 0;
+  for (const KVCache& cache : caches) {
+    for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
+      bytes += tensor.tensor.numel() * tensor.tensor.element_size();
+    }
+  }
+  return bytes;
 }
 
 class IndexerCacheDtypeConfigGuard final {
@@ -305,6 +317,146 @@ TEST(KVCacheTest, GroupedCacheCapabilitySurvivesProtoRoundTrip) {
   EXPECT_TRUE(restored.has_grouped_cache_layout());
   EXPECT_EQ(restored.key_cache_shape(), original.key_cache_shape());
 }
+
+TEST(KVCacheTest, DeepSeekV4CompressorStateUsesConfiguredDtype) {
+  KVCacheCapacity capacity;
+  capacity.block_size(128).swa_count(10).c4_count(32).c128_count(1);
+
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4");
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+
+  KVCacheCreateOptions options;
+  options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kBFloat16)
+      .num_layers(2)
+      .model_type("deepseek_v4")
+      .block_size(128)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(512)
+      .compress_ratios({4, 128})
+      .dsv4_compress_state_dtype(torch::kBFloat16);
+
+  std::vector<KVCache> caches;
+  allocate_kv_caches(caches, shape, options);
+
+  ASSERT_EQ(caches.size(), 2U);
+  EXPECT_EQ(caches[0].get_compress_kv_state().scalar_type(),
+            torch::kBFloat16);
+  EXPECT_EQ(caches[0].get_compress_score_state().scalar_type(),
+            torch::kBFloat16);
+  EXPECT_EQ(caches[0].get_compress_index_kv_state().scalar_type(),
+            torch::kBFloat16);
+  EXPECT_EQ(caches[1].get_compress_kv_state().scalar_type(),
+            torch::kBFloat16);
+  EXPECT_EQ(caches[1].get_compress_score_state().scalar_type(),
+            torch::kBFloat16);
+}
+
+#if defined(USE_NPU)
+TEST(KVCacheTest, DeepSeekV4CpAllocatesOnlyOwnerLocalPhysicalPools) {
+  constexpr int32_t kCpSize = 8;
+  constexpr int64_t kC4Count = 65;
+  constexpr int64_t kC128Count = 9;
+  constexpr int64_t kBlockSize = 8;
+  constexpr int64_t kHeadDim = 16;
+  constexpr int64_t kIndexHeadDim = 8;
+
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(kHeadDim)
+      .index_head_dim(kIndexHeadDim)
+      .window_size(65)
+      .compress_ratios({1, 4, 128});
+  KVCacheEstimateOptions estimate_options;
+  estimate_options.dtype = torch::kBFloat16;
+  estimate_options.dsv4_compress_state_dtype = torch::kFloat32;
+  estimate_options.block_size = kBlockSize;
+  estimate_options.max_seqs_per_batch = 5;
+  estimate_options.max_tokens_per_batch = 37;
+  estimate_options.dsv4_cp_size = kCpSize;
+  const Dsv4KVCacheEstimateCost cost =
+      estimate_dsv4_kv_cache_cost(model_args, estimate_options);
+
+  KVCacheCapacity capacity;
+  capacity.block_size(kBlockSize)
+      .swa_count(cost.swa_count)
+      .c4_count(kC4Count)
+      .c128_count(kC128Count);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+
+  std::vector<KVCache> rank_zero_caches;
+  for (int32_t cp_rank = 0; cp_rank < kCpSize; ++cp_rank) {
+    KVCacheCreateOptions create_options;
+    create_options.device(torch::Device(torch::kCPU))
+        .dtype(torch::kBFloat16)
+        .num_layers(3)
+        .model_type("deepseek_v4")
+        .block_size(kBlockSize)
+        .head_dim(kHeadDim)
+        .index_head_dim(kIndexHeadDim)
+        .window_size(65)
+        .compress_ratios({1, 4, 128})
+        .dsv4_compress_state_dtype(torch::kFloat32)
+        .dsv4_cp_cache_sharding(true)
+        .dsv4_cp_size(kCpSize)
+        .dsv4_cp_rank(cp_rank);
+
+    std::vector<KVCache> caches;
+    allocate_kv_caches(caches, shape, create_options);
+    const Dsv4CpCacheLayout layout(kCpSize, cp_rank);
+    const int64_t local_swa = layout.local_block_count(cost.swa_count);
+    const int64_t local_c4 = layout.local_block_count(kC4Count);
+    const int64_t local_c128 = layout.local_block_count(kC128Count);
+    ASSERT_EQ(caches.size(), 3U);
+    EXPECT_EQ(caches[0].get_swa_cache().size(0), local_swa);
+    EXPECT_EQ(caches[1].get_k_cache().size(0), local_c4);
+    EXPECT_EQ(caches[1].get_index_cache().size(0), local_c4);
+    EXPECT_EQ(caches[1].get_swa_cache().size(0), local_swa);
+    EXPECT_EQ(caches[1].get_compress_kv_state().size(0), local_swa);
+    EXPECT_EQ(caches[1].get_compress_index_kv_state().size(0), local_swa);
+    EXPECT_EQ(caches[2].get_k_cache().size(0), local_c128);
+    EXPECT_EQ(caches[2].get_swa_cache().size(0), local_swa);
+    EXPECT_EQ(cache_tensor_bytes(caches),
+              dsv4_kv_cache_physical_bytes(
+                  cost, kC4Count, kC128Count, cp_rank));
+    if (cp_rank == 0) {
+      rank_zero_caches = std::move(caches);
+    }
+  }
+
+  KVCacheCreateOptions draft_options;
+  draft_options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kBFloat16)
+      .num_layers(3)
+      .model_type("deepseek_v4_mtp")
+      .block_size(kBlockSize)
+      .head_dim(kHeadDim)
+      .index_head_dim(kIndexHeadDim)
+      .window_size(65)
+      .compress_ratios({1, 4, 128})
+      .dsv4_compress_state_dtype(torch::kFloat32)
+      .dsv4_cp_cache_sharding(true)
+      .dsv4_cp_size(kCpSize)
+      .dsv4_cp_rank(0);
+  std::vector<KVCache> draft_caches;
+  allocate_kv_caches(draft_caches, shape, draft_options);
+  ASSERT_EQ(rank_zero_caches.size(), draft_caches.size());
+  for (size_t layer = 0; layer < rank_zero_caches.size(); ++layer) {
+    const std::vector<KVCacheTensor> target_tensors =
+        rank_zero_caches[layer].get_cache_tensors();
+    const std::vector<KVCacheTensor> draft_tensors =
+        draft_caches[layer].get_cache_tensors();
+    ASSERT_EQ(target_tensors.size(), draft_tensors.size());
+    for (size_t role = 0; role < target_tensors.size(); ++role) {
+      EXPECT_NE(target_tensors[role].tensor.data_ptr(),
+                draft_tensors[role].tensor.data_ptr());
+    }
+  }
+}
+#endif
 
 TEST(KVCacheTest, DeepSeekV4KVCacheExposesIndexerScaleThroughSharedContract) {
   DeepSeekV4KVCacheTensors tensors;

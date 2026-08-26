@@ -43,6 +43,7 @@ TEST(NpuCpCapabilityTest, RegisteredCpCapableModels) {
   EXPECT_TRUE(dsv4.supports_mtp_prefill);
   EXPECT_TRUE(dsv4.requires_kv_split_one);
   EXPECT_TRUE(dsv4.requires_split_compressor);
+  EXPECT_TRUE(dsv4.requires_owner_sparse_attention);
 }
 
 TEST(NpuCpCapabilityTest, UnregisteredModelsAreNotCapable) {

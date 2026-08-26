@@ -175,11 +175,44 @@ TEST(Dsv4CpMetadataBuilderTest,
 
   ASSERT_NE(metadata.dsa_metadata, nullptr);
   const DSAMetadata& dsa = *metadata.dsa_metadata;
+  EXPECT_EQ(dsa.host_q_seq_lens, std::vector<int32_t>({8}));
+  EXPECT_EQ(dsa.host_kv_seq_lens, std::vector<int32_t>({8}));
   ASSERT_EQ(dsa.c4_pad_positions.numel(), 3);
   ASSERT_EQ(dsa.slot_mappings.size(), 1u);
   ASSERT_EQ(dsa.slot_mappings[0].size(), 1u);
+  ASSERT_EQ(dsa.host_block_tables.size(), 1u);
+  ASSERT_EQ(dsa.host_block_tables[0].size(), 1u);
+  EXPECT_TRUE(dsa.host_block_tables[0][0].device().is_cpu());
+  EXPECT_EQ(tensor_values<int32_t>(dsa.host_block_tables[0][0]),
+            std::vector<int32_t>({7}));
   EXPECT_EQ(tensor_values<int32_t>(dsa.slot_mappings[0][0]),
             std::vector<int32_t>({7 * 128, 7 * 128 + 1, -1}));
+}
+
+TEST(Dsv4CpMetadataBuilderTest, RetainsMixedBatchHostSequenceLengths) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::MIXED;
+  params.meta.num_sequences = 2;
+  params.meta.actual_num_sequences = 2;
+  params.attention.host.q_seq_lens = {1, 4};
+  params.attention.host.kv_seq_lens = {20, 4};
+  params.attention.device.q_seq_lens =
+      torch::tensor({1, 4}, torch::kInt32);
+  params.attention.device.kv_seq_lens =
+      torch::tensor({20, 4}, torch::kInt32);
+
+  const AttentionMetadata metadata = DSAMetadataBuilder::build(
+      params,
+      torch::tensor({19, 0, 1, 2, 3}, torch::kInt32),
+      torch::Tensor(),
+      /*caches_info=*/{},
+      /*group_infos=*/{});
+
+  ASSERT_NE(metadata.dsa_metadata, nullptr);
+  EXPECT_EQ(metadata.dsa_metadata->host_q_seq_lens,
+            std::vector<int32_t>({1, 4}));
+  EXPECT_EQ(metadata.dsa_metadata->host_kv_seq_lens,
+            std::vector<int32_t>({20, 4}));
 }
 
 }  // namespace

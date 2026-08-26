@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_policy.h"
 
 namespace xllm {
 namespace {
@@ -271,6 +272,24 @@ TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {
 
   config.indexer_cache_dtype("int8");
   config.validate();
+}
+
+TEST(KVCacheConfigValidationTest, AcceptsSupportedDsv4StateDtypes) {
+  for (const char* value : {"float32", "fp32", "bfloat16", "bf16"}) {
+    KVCacheConfig config;
+    config.dsv4_compress_state_dtype(value);
+    config.validate();
+  }
+}
+
+TEST(KVCacheConfigValidationTest, RejectsUnsupportedDsv4StateDtypes) {
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.dsv4_compress_state_dtype("float16");
+        config.validate();
+      },
+      "dsv4_compress_state_dtype.*float32.*bfloat16");
 }
 
 TEST(KVCacheConfigValidationTest, RejectsUnsupportedIndexerCacheDtypes) {

@@ -61,10 +61,14 @@ limitations under the License.
 // @indexer_cache_dtype
 // @enable_mtp_draft_body_tp1
 // @text_encoder_tp_size
+// @dsv4_compress_state_dtype
 int main(int argc, char* argv[]) {
   const std::optional<std::string> parsed_indexer_cache_dtype =
       xllm::spawn_worker_protocol::parse_indexer_cache_dtype(argc, argv);
-  if (!parsed_indexer_cache_dtype.has_value()) {
+  const std::optional<std::string> parsed_dsv4_compress_state_dtype =
+      xllm::spawn_worker_protocol::parse_dsv4_compress_state_dtype(argc, argv);
+  if (!parsed_indexer_cache_dtype.has_value() ||
+      !parsed_dsv4_compress_state_dtype.has_value()) {
     LOG(ERROR) << "Spawn worker process received invalid args. Need at least "
                << xllm::spawn_worker_protocol::kMinimumArgumentCount
                << " args, received " << argc;
@@ -75,6 +79,14 @@ int main(int argc, char* argv[]) {
                     "indexer_cache_dtype. Defaulting indexer_cache_dtype to "
                  << xllm::spawn_worker_protocol::kDefaultIndexerCacheDtype
                  << ".";
+  }
+  if (argc <=
+      xllm::spawn_worker_protocol::kDsv4CompressStateDtypeArgumentIndex) {
+    LOG(WARNING)
+        << "Spawn worker process received legacy args without "
+           "dsv4_compress_state_dtype. Defaulting dsv4_compress_state_dtype "
+           "to "
+        << xllm::spawn_worker_protocol::kDefaultDsv4CompressStateDtype << ".";
   }
 
   std::string master_node_addr = std::string(argv[1]);
@@ -113,6 +125,8 @@ int main(int argc, char* argv[]) {
   int32_t ep_size = static_cast<int32_t>(atoi(argv[32]));
   std::string instance_role_str = std::string(argv[33]);
   const std::string& indexer_cache_dtype = parsed_indexer_cache_dtype.value();
+  const std::string& dsv4_compress_state_dtype =
+      parsed_dsv4_compress_state_dtype.value();
   const bool enable_mtp_draft_body_tp1 =
       argc > xllm::spawn_worker_protocol::kEnableMtpDraftBodyTp1ArgumentIndex &&
       static_cast<int32_t>(
@@ -168,6 +182,7 @@ int main(int argc, char* argv[]) {
       << ", sp_size = " << sp_size << ", cfg_size = " << cfg_size
       << ", text_encoder_tp_size = " << text_encoder_tp_size
       << ", indexer_cache_dtype = " << indexer_cache_dtype
+      << ", dsv4_compress_state_dtype = " << dsv4_compress_state_dtype
       << ", enable_mtp_draft_body_tp1 = " << enable_mtp_draft_body_tp1 << "\n";
 
   xllm::SpawnWorkerServer worker(master_node_addr,
@@ -178,6 +193,7 @@ int main(int argc, char* argv[]) {
                                  num_decoding_tokens,
                                  block_size,
                                  indexer_cache_dtype,
+                                 dsv4_compress_state_dtype,
                                  max_tokens_per_batch,
                                  max_seqs_per_batch,
                                  enable_shm > 0,

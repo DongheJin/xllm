@@ -116,8 +116,10 @@ bool resolve_model_registration(const std::string& model_type,
   if (backend == kAutoBackend) {
     effective_backend =
         is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
-  } else if (model_type == "qwen3" || model_type == "qwen3_moe") {
-    // qwen3/qwen3_moe support both backends.
+  } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
+             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
+             model_type == "qwen3_vl") {
+    // These models support both ATB and TORCH backends.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -200,6 +202,7 @@ bool is_npu_model_cp_capable(const std::string& resolved_name) {
     dsv4_capability.supports_mtp_prefill = true;
     dsv4_capability.requires_kv_split_one = true;
     dsv4_capability.requires_split_compressor = true;
+    dsv4_capability.requires_owner_sparse_attention = true;
     ModelRegistry::register_npu_cp_capability("deepseek_v4", dsv4_capability);
     ModelRegistry::register_npu_cp_capability("deepseek_v4_mtp",
                                               dsv4_capability);
@@ -263,6 +266,17 @@ void ModelRegistry::register_dit_model_factory(const std::string& name,
   } else {
     instance->model_registry_[name].dit_model_factory = factory;
     instance->model_backend_[name] = "dit";
+  }
+}
+
+void ModelRegistry::register_model_backend(const std::string& name,
+                                           const std::string& backend) {
+  ModelRegistry* instance = get_instance();
+  auto [it, inserted] = instance->model_backend_.emplace(name, backend);
+  if (!inserted && it->second != backend) {
+    SAFE_LOG_WARNING("model backend for "
+                     << name << " already registered as " << it->second
+                     << "; ignoring conflicting backend " << backend << ".");
   }
 }
 

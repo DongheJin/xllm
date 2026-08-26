@@ -972,6 +972,27 @@ void ProfileManager::warmup_decode_for_graph() {
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
   int32_t decode_seq_len = std::min(16, max_context_len);
+  const int32_t num_speculative_tokens =
+      ::xllm::SpeculativeConfig::get_instance().num_speculative_tokens();
+  size_t decode_sequence_capacity =
+      static_cast<size_t>(decode_seq_len) +
+      static_cast<size_t>(num_speculative_tokens) + 1;
+  if (options_.enable_schedule_overlap()) {
+    decode_sequence_capacity +=
+        static_cast<size_t>(num_speculative_tokens) + 1;
+  }
+  const int32_t cache_batch_capacity = graph_decode_batch_capacity(
+      max_decode_batch_size,
+      block_manager_pool_->fresh_sequence_capacities(
+          decode_sequence_capacity));
+  CHECK_GT(cache_batch_capacity, 0)
+      << "Graph decode warmup has no cache capacity for one sequence.";
+  if (cache_batch_capacity < max_decode_batch_size) {
+    LOG(WARNING) << "Graph decode warmup batch size reduced from "
+                 << max_decode_batch_size << " to " << cache_batch_capacity
+                 << " by the available per-sequence cache resources.";
+    max_decode_batch_size = cache_batch_capacity;
+  }
 
   std::vector<int32_t> decode_batch_sizes =
       graph_decode_buckets(max_decode_batch_size, options_.dp_size());

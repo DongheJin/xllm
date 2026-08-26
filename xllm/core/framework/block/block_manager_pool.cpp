@@ -361,6 +361,18 @@ std::vector<size_t> BlockManagerPool::num_used_blocks() const {
   return num_used_blocks;
 }
 
+std::vector<size_t> BlockManagerPool::fresh_sequence_capacities(
+    size_t num_tokens) const {
+  std::vector<size_t> capacities;
+  capacities.reserve(block_managers_.size());
+  for (const auto& manager : block_managers_) {
+    const auto* composite =
+        static_cast<const CompositeBlockManager*>(manager.get());
+    capacities.emplace_back(composite->fresh_sequence_capacity(num_tokens));
+  }
+  return capacities;
+}
+
 double BlockManagerPool::kv_cache_utilization() const {
   int32_t dp_rank = get_manager_with_max_free_blocks();
   return block_managers_[dp_rank]->kv_cache_utilization();

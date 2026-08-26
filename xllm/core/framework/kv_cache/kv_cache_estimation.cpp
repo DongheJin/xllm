@@ -17,12 +17,15 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
+#include <optional>
 #include <vector>
 
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
+#include "framework/kv_cache/deepseek_v4_cp_cache_layout.h"
 #include "framework/model/model_args.h"
 #include "util/pretty_print.h"
 #include "util/tensor_helper.h"
@@ -244,6 +247,8 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
   return std::min<int64_t>(auto_blocks, max_blocks);
 }
 
+}  // namespace
+
 Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options) {
@@ -261,11 +266,17 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
   const int64_t index_head_dim =
       std::max<int64_t>(model_args.index_head_dim(), 1);
   const std::vector<int32_t>& compress_ratios = model_args.compress_ratios();
-  const int64_t float32_size = 4;
+  CHECK(options.dsv4_compress_state_dtype == torch::kFloat32 ||
+        options.dsv4_compress_state_dtype == torch::kBFloat16)
+      << "DSV4 compressor state dtype must be FP32 or BF16";
+  const int64_t state_dtype_size = static_cast<int64_t>(torch::elementSize(
+      options.dsv4_compress_state_dtype));
   const int64_t dtype_size =
       static_cast<int64_t>(torch::elementSize(options.dtype));
+  CHECK_GT(options.dsv4_cp_size, 0) << "DSV4 cp_size must be positive";
 
   Dsv4KVCacheEstimateCost cache_cost;
+  cache_cost.cp_size = options.dsv4_cp_size;
   cache_cost.swa_count = get_swa_pool_num_blocks(
       swa_blocks_per_seq,
       max_seqs,
@@ -284,18 +295,16 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
   const int64_t n_c1_layers =
       model_args.n_layers() - cache_cost.n_c4_layers - cache_cost.n_c128_layers;
 
-  const int64_t swa_bytes_per_c1_layer =
-      cache_cost.swa_count * block_size * head_dim * dtype_size;
+  const int64_t swa_bytes_per_c1_layer = block_size * head_dim * dtype_size;
   const int64_t swa_bytes_per_c4_layer =
-      cache_cost.swa_count *
-      (block_size * head_dim * dtype_size +
-       block_size * (2 * head_dim * float32_size) * 2 +
-       block_size * (2 * index_head_dim * float32_size) * 2);
+      block_size * head_dim * dtype_size +
+      block_size * (2 * head_dim * state_dtype_size) * 2 +
+      block_size * (2 * index_head_dim * state_dtype_size) * 2;
   const int64_t swa_bytes_per_c128_layer =
-      cache_cost.swa_count * (block_size * head_dim * dtype_size +
-                              block_size * head_dim * float32_size * 2);
+      block_size * head_dim * dtype_size +
+      block_size * head_dim * state_dtype_size * 2;
 
-  cache_cost.constant_swa_bytes =
+  cache_cost.swa_bytes_per_local_block =
       n_c1_layers * swa_bytes_per_c1_layer +
       cache_cost.n_c4_layers * swa_bytes_per_c4_layer +
       cache_cost.n_c128_layers * swa_bytes_per_c128_layer;
@@ -309,21 +318,121 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
       (head_dim * dtype_size + index_head_dim * cache_policy.index_dtype_size +
        scale_bytes);
   const int64_t bytes_per_c128_block = block_size * head_dim * dtype_size;
+  cache_cost.c4_bytes_per_local_block =
+      cache_cost.n_c4_layers * bytes_per_c4_block;
+  cache_cost.c128_bytes_per_local_block =
+      cache_cost.n_c128_layers * bytes_per_c128_block;
+  cache_cost.constant_swa_bytes = dsv4_kv_cache_physical_bytes(
+      cache_cost, /*global_c4_count=*/0, /*global_c128_count=*/0, /*cp_rank=*/0);
 
   if (cache_cost.n_c4_layers > 0 && cache_cost.n_c128_layers > 0) {
     cache_cost.token_unit_bytes =
-        32 * cache_cost.n_c4_layers * bytes_per_c4_block +
-        cache_cost.n_c128_layers * bytes_per_c128_block;
+        32 * cache_cost.c4_bytes_per_local_block +
+        cache_cost.c128_bytes_per_local_block;
     cache_cost.manager_blocks_per_unit = 128;
   } else if (cache_cost.n_c4_layers > 0) {
-    cache_cost.token_unit_bytes = cache_cost.n_c4_layers * bytes_per_c4_block;
+    cache_cost.token_unit_bytes = cache_cost.c4_bytes_per_local_block;
     cache_cost.manager_blocks_per_unit = 4;
   } else if (cache_cost.n_c128_layers > 0) {
-    cache_cost.token_unit_bytes =
-        cache_cost.n_c128_layers * bytes_per_c128_block;
+    cache_cost.token_unit_bytes = cache_cost.c128_bytes_per_local_block;
     cache_cost.manager_blocks_per_unit = 128;
   }
   return cache_cost;
+}
+
+int64_t dsv4_kv_cache_physical_bytes(const Dsv4KVCacheEstimateCost& cost,
+                                     int64_t global_c4_count,
+                                     int64_t global_c128_count,
+                                     int32_t cp_rank) {
+  CHECK_GT(cost.cp_size, 0);
+  CHECK_GE(global_c4_count, 0);
+  CHECK_GE(global_c128_count, 0);
+  const Dsv4CpCacheLayout layout(cost.cp_size, cp_rank);
+  const __int128 physical_bytes =
+      static_cast<__int128>(layout.local_block_count(cost.swa_count)) *
+          cost.swa_bytes_per_local_block +
+      static_cast<__int128>(layout.local_block_count(global_c4_count)) *
+          cost.c4_bytes_per_local_block +
+      static_cast<__int128>(layout.local_block_count(global_c128_count)) *
+          cost.c128_bytes_per_local_block;
+  CHECK(physical_bytes <=
+        static_cast<__int128>(std::numeric_limits<int64_t>::max()))
+      << "DSV4 physical cache byte count overflows int64";
+  return static_cast<int64_t>(physical_bytes);
+}
+
+namespace {
+
+struct Dsv4PoolCounts {
+  int64_t c4 = 0;
+  int64_t c128 = 0;
+};
+
+Dsv4PoolCounts dsv4_pool_counts_for_units(
+    const Dsv4KVCacheEstimateCost& cost,
+    int64_t token_unit_count) {
+  CHECK_GE(token_unit_count, 0);
+  Dsv4PoolCounts counts;
+  if (cost.n_c4_layers > 0 && cost.n_c128_layers > 0) {
+    CHECK_LE(token_unit_count, std::numeric_limits<int64_t>::max() / 32)
+        << "DSV4 C4 global block count overflows int64";
+    counts.c4 = 32 * token_unit_count;
+    counts.c128 = token_unit_count;
+  } else if (cost.n_c4_layers > 0) {
+    counts.c4 = token_unit_count;
+  } else if (cost.n_c128_layers > 0) {
+    counts.c128 = token_unit_count;
+  }
+  return counts;
+}
+
+__int128 dsv4_dynamic_physical_bytes(const Dsv4KVCacheEstimateCost& cost,
+                                     int64_t token_unit_count) {
+  const Dsv4PoolCounts counts =
+      dsv4_pool_counts_for_units(cost, token_unit_count);
+  return static_cast<__int128>(dsv4_kv_cache_physical_bytes(
+             cost, counts.c4, counts.c128, /*cp_rank=*/0)) -
+         cost.constant_swa_bytes;
+}
+
+int64_t max_dsv4_token_units(
+    const std::vector<const Dsv4KVCacheEstimateCost*>& costs,
+    int64_t dynamic_budget) {
+  CHECK_GE(dynamic_budget, 0);
+  CHECK(!costs.empty());
+  int64_t max_cp_size = 1;
+  __int128 token_unit_bytes = 0;
+  for (const Dsv4KVCacheEstimateCost* cost : costs) {
+    CHECK(cost != nullptr);
+    max_cp_size = std::max<int64_t>(max_cp_size, cost->cp_size);
+    token_unit_bytes += cost->token_unit_bytes;
+  }
+  if (token_unit_bytes == 0) {
+    return 0;
+  }
+
+  // Every max_cp_size logical units consume at least one unsharded unit of
+  // each pool. This gives a finite upper bound despite owner-count ceil steps.
+  const __int128 upper =
+      (static_cast<__int128>(dynamic_budget) / token_unit_bytes + 1) *
+      max_cp_size;
+  CHECK(upper <= static_cast<__int128>(std::numeric_limits<int64_t>::max()))
+      << "DSV4 token-unit search bound overflows int64";
+  int64_t low = 0;
+  int64_t high = static_cast<int64_t>(upper);
+  while (low < high) {
+    const int64_t mid = low + (high - low + 1) / 2;
+    __int128 physical_bytes = 0;
+    for (const Dsv4KVCacheEstimateCost* cost : costs) {
+      physical_bytes += dsv4_dynamic_physical_bytes(*cost, mid);
+    }
+    if (physical_bytes <= dynamic_budget) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return low;
 }
 
 void init_dsv4_counts(const ModelArgs& model_args,
@@ -332,9 +441,9 @@ void init_dsv4_counts(const ModelArgs& model_args,
   CHECK(kv_cache_cap != nullptr);
   const Dsv4KVCacheEstimateCost cache_cost =
       estimate_dsv4_kv_cache_cost(model_args, options);
-  int64_t token_mem = std::max(
-      static_cast<int64_t>(0),
-      kv_cache_cap->cache_size_in_bytes() - cache_cost.constant_swa_bytes);
+  std::vector<const Dsv4KVCacheEstimateCost*> costs{&cache_cost};
+  std::optional<Dsv4KVCacheEstimateCost> draft_cost;
+  int64_t constant_bytes = cache_cost.constant_swa_bytes;
 
   if (options.draft_model_args != nullptr) {
     CHECK(options.draft_options != nullptr)
@@ -343,60 +452,64 @@ void init_dsv4_counts(const ModelArgs& model_args,
                                      /*target_type=*/"deepseek_v4",
                                      /*match_mtp=*/true))
         << "DSV4 MTP kv cache estimation only supports DeepSeek V4 draft";
-    const Dsv4KVCacheEstimateCost draft_cost = estimate_dsv4_kv_cache_cost(
-        *options.draft_model_args, *options.draft_options);
-    const int64_t constant_bytes =
-        cache_cost.constant_swa_bytes + draft_cost.constant_swa_bytes;
-    CHECK_GT(kv_cache_cap->cache_size_in_bytes(), constant_bytes)
-        << "no memory left for mtp target/draft fixed kv cache allocation";
-
-    const int64_t token_unit_bytes =
-        cache_cost.token_unit_bytes + draft_cost.token_unit_bytes;
-    CHECK_GT(token_unit_bytes, 0)
-        << "mtp target and draft token unit bytes must be positive";
-    const int64_t token_unit_count =
-        (kv_cache_cap->cache_size_in_bytes() - constant_bytes) /
-        token_unit_bytes;
-    CHECK_GT(token_unit_count, 0)
-        << "no memory left for mtp target/draft kv cache token blocks";
-
-    const int64_t adjusted_cache_size_in_bytes =
-        cache_cost.constant_swa_bytes +
-        token_unit_count * cache_cost.token_unit_bytes;
-    CHECK_GT(adjusted_cache_size_in_bytes, 0)
-        << "no memory left for mtp target/draft kv cache allocation";
-    LOG(INFO) << "mtp kv cache capacity adjusted from "
-              << readable_size(kv_cache_cap->cache_size_in_bytes()) << " to "
-              << readable_size(adjusted_cache_size_in_bytes)
-              << ", target_constant_bytes=" << cache_cost.constant_swa_bytes
-              << ", draft_constant_bytes=" << draft_cost.constant_swa_bytes
-              << ", target_token_unit_bytes=" << cache_cost.token_unit_bytes
-              << ", draft_token_unit_bytes=" << draft_cost.token_unit_bytes
-              << ", token_unit_count=" << token_unit_count;
-    kv_cache_cap->cache_size_in_bytes(adjusted_cache_size_in_bytes);
-    token_mem = token_unit_count * cache_cost.token_unit_bytes;
+    draft_cost.emplace(estimate_dsv4_kv_cache_cost(
+        *options.draft_model_args, *options.draft_options));
+    costs.push_back(&*draft_cost);
+    constant_bytes += draft_cost->constant_swa_bytes;
   } else {
     CHECK(options.draft_options == nullptr)
         << "DSV4 draft options require draft model args";
   }
 
+  CHECK_GT(kv_cache_cap->cache_size_in_bytes(), constant_bytes)
+      << "no memory left for DSV4 fixed owner-local kv cache allocation";
+  const int64_t token_mem =
+      kv_cache_cap->cache_size_in_bytes() - constant_bytes;
+  const int64_t token_unit_count =
+      max_dsv4_token_units(costs, token_mem);
+  const bool has_dynamic_token_pool = std::any_of(
+      costs.begin(), costs.end(), [](const Dsv4KVCacheEstimateCost* cost) {
+        return cost->token_unit_bytes > 0;
+      });
+  if (has_dynamic_token_pool) {
+    CHECK_GT(token_unit_count, 0)
+        << "no memory left for DSV4 owner-local kv cache token blocks";
+  }
+  const Dsv4PoolCounts target_counts =
+      dsv4_pool_counts_for_units(cache_cost, token_unit_count);
+
+  if (draft_cost.has_value()) {
+    const int64_t original_cache_size = kv_cache_cap->cache_size_in_bytes();
+    const int64_t adjusted_cache_size_in_bytes =
+        dsv4_kv_cache_physical_bytes(cache_cost,
+                                     target_counts.c4,
+                                     target_counts.c128,
+                                     /*cp_rank=*/0);
+    LOG(INFO) << "mtp kv cache capacity adjusted from "
+              << readable_size(original_cache_size) << " to "
+              << readable_size(adjusted_cache_size_in_bytes)
+              << ", target_constant_bytes=" << cache_cost.constant_swa_bytes
+              << ", draft_constant_bytes="
+              << draft_cost->constant_swa_bytes
+              << ", target_token_unit_bytes=" << cache_cost.token_unit_bytes
+              << ", draft_token_unit_bytes=" << draft_cost->token_unit_bytes
+              << ", cp_size=" << cache_cost.cp_size
+              << ", token_unit_count=" << token_unit_count;
+    kv_cache_cap->cache_size_in_bytes(adjusted_cache_size_in_bytes);
+  }
+
   kv_cache_cap->swa_count(cache_cost.swa_count);
   kv_cache_cap->c4_count(0);
   kv_cache_cap->c128_count(0);
-  if (cache_cost.n_c4_layers > 0 && cache_cost.n_c128_layers > 0) {
-    if (cache_cost.token_unit_bytes > 0 && token_mem > 0) {
-      kv_cache_cap->c128_count(token_mem / cache_cost.token_unit_bytes);
-      kv_cache_cap->c4_count(32 * kv_cache_cap->c128_count());
-    }
-  } else if (cache_cost.n_c4_layers > 0) {
-    if (cache_cost.token_unit_bytes > 0 && token_mem > 0) {
-      kv_cache_cap->c4_count(token_mem / cache_cost.token_unit_bytes);
-    }
-  } else if (cache_cost.n_c128_layers > 0) {
-    if (cache_cost.token_unit_bytes > 0 && token_mem > 0) {
-      kv_cache_cap->c128_count(token_mem / cache_cost.token_unit_bytes);
-    }
-  }
+  LOG(INFO) << "DSV4 capacity count inputs: n_c4_layers="
+            << cache_cost.n_c4_layers
+            << ", n_c128_layers=" << cache_cost.n_c128_layers
+            << ", token_mem=" << token_mem
+            << ", token_unit_bytes=" << cache_cost.token_unit_bytes
+            << ", cache_size=" << kv_cache_cap->cache_size_in_bytes()
+            << ", constant_swa_bytes=" << cache_cost.constant_swa_bytes;
+  kv_cache_cap->c4_count(target_counts.c4);
+  kv_cache_cap->c128_count(target_counts.c128);
 
   CHECK_GT(kv_cache_cap->swa_count(), 0) << "DSV4 swa_count must be > 0";
   if (cache_cost.n_c4_layers > 0) {

@@ -15,25 +15,107 @@ limitations under the License.
 #include "deepseek_sparse_attention.h"
 
 #include <glog/logging.h>
-
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
 #include "common/flash_comm1_context.h"
 #include "framework/parallel_state/npu_cp_plan.h"
 #include "kernels/ops_api.h"
+#include "layers/npu_torch/deepseek_v4_cp_attention_exchange.h"
 #include "layers/npu_torch/deepseek_v4_cp_execution.h"
+#include "layers/npu_torch/deepseek_v4_cp_owner_attention.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
 namespace xllm {
 namespace layer {
 namespace {
+
+constexpr const char* kCpTensorDebugPrefix = "[DEBUG-DSV4-CP-TENSOR]";
+
+bool cp_tensor_debug_enabled(int32_t layer_id) {
+  const char* enabled = std::getenv("XLLM_DSV4_CP_TENSOR_DEBUG");
+  if (enabled == nullptr || std::string(enabled) != "1") {
+    return false;
+  }
+  const char* layer_filter =
+      std::getenv("XLLM_DSV4_CP_TENSOR_DEBUG_LAYER");
+  if (layer_filter == nullptr || *layer_filter == '\0') {
+    return true;
+  }
+  char* end = nullptr;
+  const long requested_layer = std::strtol(layer_filter, &end, 10);
+  return end != layer_filter && *end == '\0' && requested_layer == layer_id;
+}
+
+void log_cp_tensor_summary(int32_t layer_id,
+                           int32_t cp_rank,
+                           const char* stage,
+                           const char* name,
+                           const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    LOG(INFO) << kCpTensorDebugPrefix << " layer=" << layer_id
+              << " cp_rank=" << cp_rank << " stage=" << stage
+              << " name=" << name << " defined=0";
+    return;
+  }
+
+  int64_t nan_count = 0;
+  int64_t pos_inf_count = 0;
+  int64_t neg_inf_count = 0;
+  int64_t finite_count = 0;
+  double finite_min = 0.0;
+  double finite_max = 0.0;
+  double finite_mean = 0.0;
+  int64_t nonnegative_count = 0;
+  int64_t integer_min = 0;
+  int64_t integer_max = 0;
+
+  if (tensor.numel() > 0 && tensor.is_floating_point()) {
+    const torch::Tensor nan_mask = torch::isnan(tensor);
+    const torch::Tensor pos_inf_mask = torch::isposinf(tensor);
+    const torch::Tensor neg_inf_mask = torch::isneginf(tensor);
+    const torch::Tensor finite_mask = torch::isfinite(tensor);
+    nan_count = nan_mask.sum().item<int64_t>();
+    pos_inf_count = pos_inf_mask.sum().item<int64_t>();
+    neg_inf_count = neg_inf_mask.sum().item<int64_t>();
+    finite_count = finite_mask.sum().item<int64_t>();
+    if (finite_count > 0) {
+      const torch::Tensor finite_values =
+          tensor.masked_select(finite_mask).to(torch::kFloat32);
+      finite_min = finite_values.min().item<double>();
+      finite_max = finite_values.max().item<double>();
+      finite_mean = finite_values.mean().item<double>();
+    }
+  } else if (tensor.numel() > 0 && tensor.scalar_type() != torch::kBool) {
+    const torch::Tensor values = tensor.to(torch::kInt64);
+    nonnegative_count = values.ge(0).sum().item<int64_t>();
+    integer_min = values.min().item<int64_t>();
+    integer_max = values.max().item<int64_t>();
+  }
+
+  LOG(INFO) << kCpTensorDebugPrefix << " layer=" << layer_id
+            << " cp_rank=" << cp_rank << " stage=" << stage
+            << " name=" << name << " shape=" << tensor.sizes()
+            << " dtype=" << tensor.scalar_type()
+            << " contiguous=" << tensor.is_contiguous()
+            << " numel=" << tensor.numel() << " nan=" << nan_count
+            << " pos_inf=" << pos_inf_count
+            << " neg_inf=" << neg_inf_count << " finite=" << finite_count
+            << " finite_min=" << finite_min << " finite_max=" << finite_max
+            << " finite_mean=" << finite_mean
+            << " nonnegative=" << nonnegative_count
+            << " integer_min=" << integer_min
+            << " integer_max=" << integer_max;
+}
 
 struct Dsv4PreprocessOutputs {
   torch::Tensor qr;
@@ -337,6 +419,171 @@ std::tuple<torch::Tensor, torch::Tensor> build_prefill_pa_nd_kv(
   return {packed_kv, table};
 }
 
+torch::Tensor make_owner_window_indices(
+    const std::vector<int32_t>& q_seq_lens,
+    const std::vector<int32_t>& kv_seq_lens,
+    const std::vector<std::vector<int32_t>>& global_to_local,
+    int64_t window_left,
+    int64_t capacity,
+    const torch::Device& device) {
+  CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size());
+  CHECK_EQ(q_seq_lens.size(), global_to_local.size());
+  CHECK_GT(capacity, 0);
+  std::vector<int32_t> values;
+  int64_t total_rows = 0;
+  for (size_t sequence = 0; sequence < q_seq_lens.size(); ++sequence) {
+    const int32_t q_len = q_seq_lens[sequence];
+    const int32_t kv_len = kv_seq_lens[sequence];
+    CHECK_GE(q_len, 0);
+    CHECK_GE(kv_len, q_len);
+    total_rows += q_len;
+    for (int32_t query = 0; query < q_len; ++query) {
+      const int32_t absolute = kv_len - q_len + query;
+      const int32_t start = std::max<int32_t>(
+          0, absolute - static_cast<int32_t>(window_left));
+      const int32_t end = std::min(absolute, kv_len - 1);
+      int64_t written = 0;
+      for (int32_t position = start;
+           position <= end && written < capacity;
+           ++position) {
+        const int32_t local = global_to_local[sequence][position];
+        if (local >= 0) {
+          values.emplace_back(local);
+          ++written;
+        }
+      }
+      values.insert(values.end(),
+                    static_cast<size_t>(capacity - written),
+                    -1);
+    }
+  }
+  CHECK_EQ(static_cast<int64_t>(values.size()), total_rows * capacity);
+  return torch::tensor(values, torch::TensorOptions().dtype(torch::kInt32))
+      .view({total_rows, 1, capacity})
+      .to(device, /*non_blocking=*/true);
+}
+
+torch::Tensor make_owner_compressed_indices(
+    const std::vector<int32_t>& q_seq_lens,
+    const std::vector<int32_t>& kv_seq_lens,
+    const std::vector<std::vector<int32_t>>& global_to_local,
+    int64_t compress_ratio,
+    int64_t capacity,
+    const torch::Tensor& global_candidates,
+    const torch::Device& device) {
+  CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size());
+  CHECK_EQ(q_seq_lens.size(), global_to_local.size());
+  CHECK_GT(compress_ratio, 0);
+  CHECK_GT(capacity, 0);
+  const torch::Tensor candidates_cpu =
+      global_candidates.defined()
+          ? global_candidates.to(torch::kCPU).to(torch::kInt64).contiguous()
+          : torch::Tensor();
+  int64_t expected_rows = 0;
+  for (int32_t q_len : q_seq_lens) {
+    CHECK_GE(q_len, 0);
+    expected_rows += q_len;
+  }
+  torch::Tensor candidate_rows;
+  int64_t candidate_width = 0;
+  if (candidates_cpu.defined()) {
+    CHECK_GE(candidates_cpu.dim(), 2)
+        << "DSV4 owner QLI candidates must be [T,...,K]";
+    CHECK_EQ(candidates_cpu.size(0), expected_rows)
+        << "DSV4 owner QLI candidates do not cover all global query rows";
+    candidate_rows = candidates_cpu.view({expected_rows, -1});
+    candidate_width = candidate_rows.size(1);
+  }
+  std::vector<int32_t> values;
+  int64_t total_rows = 0;
+  int64_t row_index = 0;
+  for (size_t sequence = 0; sequence < q_seq_lens.size(); ++sequence) {
+    const int32_t q_len = q_seq_lens[sequence];
+    const int32_t kv_len = kv_seq_lens[sequence];
+    const int32_t compressed_len =
+        static_cast<int32_t>(kv_len / compress_ratio);
+    total_rows += q_len;
+    for (int32_t query = 0; query < q_len; ++query, ++row_index) {
+      const int32_t available = static_cast<int32_t>(
+          (kv_len - q_len + query + 1) / compress_ratio);
+      int64_t written = 0;
+      auto append_global = [&](int64_t global_index) {
+        if (written >= capacity || global_index < 0 ||
+            global_index >= compressed_len || global_index >= available ||
+            global_index >=
+                static_cast<int64_t>(global_to_local[sequence].size())) {
+          return;
+        }
+        const int32_t local =
+            global_to_local[sequence][static_cast<size_t>(global_index)];
+        if (local >= 0) {
+          values.emplace_back(local);
+          ++written;
+        }
+      };
+      if (candidate_rows.defined() && candidate_width > 0) {
+        const auto row = candidate_rows.select(/*dim=*/0, row_index);
+        for (int64_t candidate = 0;
+             candidate < candidate_width && written < capacity;
+             ++candidate) {
+          append_global(row[candidate].item<int64_t>());
+        }
+      } else {
+        for (int32_t global_index = 0;
+             global_index < available && written < capacity;
+             ++global_index) {
+          append_global(global_index);
+        }
+      }
+      values.insert(values.end(),
+                    static_cast<size_t>(capacity - written),
+                    -1);
+    }
+  }
+  CHECK_EQ(static_cast<int64_t>(values.size()), total_rows * capacity);
+  return torch::tensor(values, torch::TensorOptions().dtype(torch::kInt32))
+      .view({total_rows, 1, capacity})
+      .to(device, /*non_blocking=*/true);
+}
+
+torch::Tensor make_global_cumulative_lengths(
+    const std::vector<int32_t>& lengths,
+    const torch::Device& device) {
+  std::vector<int32_t> cumulative(1, 0);
+  cumulative.reserve(lengths.size() + 1);
+  for (int32_t length : lengths) {
+    CHECK_GE(length, 0);
+    CHECK_LE(static_cast<int64_t>(cumulative.back()) + length,
+             std::numeric_limits<int32_t>::max());
+    cumulative.emplace_back(cumulative.back() + length);
+  }
+  return torch::tensor(cumulative,
+                       torch::TensorOptions().dtype(torch::kInt32))
+      .to(device, /*non_blocking=*/true);
+}
+
+CpRowLayout build_owner_row_layout(
+    const std::vector<int32_t>& global_q_seq_lens,
+    int32_t cp_size,
+    int32_t cp_rank,
+    const torch::Device& device) {
+  int64_t global_token_count = 0;
+  for (int32_t query_length : global_q_seq_lens) {
+    CHECK_GE(query_length, 0);
+    global_token_count += query_length;
+  }
+  CHECK_LE(global_token_count, std::numeric_limits<int32_t>::max());
+  CpPlanInput input;
+  input.q_seq_lens = global_q_seq_lens;
+  // Owner routing only consumes row indices. Packed ordinal positions keep
+  // CpRowLayout construction host-only without reading position tensors back
+  // from the device.
+  input.position_ids = torch::arange(
+      global_token_count,
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+  return CpRowLayout::build(input, cp_size, cp_rank, device);
+}
+
 Dsv4PreprocessOutputs run_dsv4_preprocess_fallback(
     ReplicatedLinear& q_a_proj,
     RMSNorm& q_layernorm,
@@ -557,6 +804,9 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
   const int64_t tp_size = parallel_args.tp_group_->world_size();
   tp_rank_ = parallel_args.tp_group_->rank();
   tp_size_ = tp_size;
+  cp_size_ = parallel_args.cp_size();
+  cp_rank_ = parallel_args.cp_rank();
+  cp_group_ = parallel_args.cp_group_;
   int64_t hidden_size = args.hidden_size();
   int64_t num_heads = args.n_heads();
 
@@ -565,6 +815,10 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
   CHECK_EQ(num_heads % tp_size, 0)
       << "num_heads must be divisible by tensor parallel size";
   if (parallel_args.cp_size() > 1) {
+    CHECK(cp_group_ != nullptr)
+        << "DeepSeek V4 CP requires a dedicated CP process group";
+    CHECK_EQ(cp_group_->world_size(), cp_size_);
+    CHECK_EQ(cp_group_->rank(), cp_rank_);
     CHECK(xllm::kernel::has_split_compressor())
         << "DeepSeek V4 CP requires CompressorProjection and CompressorCore "
            "custom operators during model initialization";
@@ -686,11 +940,16 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                          const Dsv4CpMetadata* cp_metadata) {
   auto [c1_metadata, c4_metadata, c128_metadata, qli_metadata] =
       compress_metadata;
-  const bool cp_enabled = cp_plan.enabled();
+  const bool model_rows_are_sharded = cp_plan.enabled();
   std::optional<Dsv4CpExecutionContext> cp_execution;
+  std::optional<CpRowLayout> synthetic_owner_layout;
+  const CpRowLayout* owner_row_layout = nullptr;
+  ProcessGroup* owner_cp_group = nullptr;
+  const std::vector<int32_t>* global_q_seq_lens = nullptr;
+  const std::vector<int32_t>* global_kv_seq_lens = nullptr;
   torch::Tensor preprocess_cos = attn_metadata.cos;
   torch::Tensor preprocess_sin = attn_metadata.sin;
-  if (cp_enabled) {
+  if (model_rows_are_sharded) {
     CHECK(is_prefill || is_chunked_prefill)
         << "DeepSeek V4 split compressor is restricted to prefill phases";
     CHECK(cp_plan.process_group() != nullptr);
@@ -702,7 +961,37 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
         cp_plan.row_layout().shard_rows(preprocess_cos, /*pad_value=*/0);
     preprocess_sin =
         cp_plan.row_layout().shard_rows(preprocess_sin, /*pad_value=*/0);
+    owner_row_layout = &cp_plan.row_layout();
+    owner_cp_group = cp_plan.process_group();
+    global_q_seq_lens = &cp_plan.global_q_seq_lens();
+    global_kv_seq_lens = &cp_plan.global_kv_seq_lens();
+  } else if (cp_size_ > 1) {
+    CHECK_EQ(attn_metadata.host_q_seq_lens.size(),
+             attn_metadata.host_kv_seq_lens.size())
+        << "DeepSeek V4 owner CP requires one KV length per query length";
+    synthetic_owner_layout.emplace(build_owner_row_layout(
+        attn_metadata.host_q_seq_lens,
+        cp_size_,
+        cp_rank_,
+        hidden_states.device()));
+    CHECK_EQ(synthetic_owner_layout->global_real_token_count(),
+             hidden_states.size(0))
+        << "DeepSeek V4 synthetic owner layout requires global-real model "
+           "rows";
+    owner_row_layout = &synthetic_owner_layout.value();
+    owner_cp_group = cp_group_;
+    global_q_seq_lens = &attn_metadata.host_q_seq_lens;
+    global_kv_seq_lens = &attn_metadata.host_kv_seq_lens;
   }
+  const bool owner_cp_enabled = owner_row_layout != nullptr;
+  const bool use_owner_fused_decode =
+      owner_cp_enabled && !is_prefill && !is_chunked_prefill;
+  torch::Tensor owner_local_hidden = hidden_states;
+  if (owner_cp_enabled && !model_rows_are_sharded) {
+    owner_local_hidden =
+        owner_row_layout->shard_rows(hidden_states, /*pad_value=*/0);
+  }
+
   Dsv4PreprocessOutputs preprocess_outputs =
       run_dsv4_preprocess_fallback(q_a_proj_,
                                    q_layernorm_,
@@ -724,43 +1013,41 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   auto q = preprocess_outputs.q;
   auto kv = preprocess_outputs.kv;
   torch::Tensor local_q = q;
+  torch::Tensor local_kv = kv;
+  if (owner_cp_enabled && !model_rows_are_sharded) {
+    local_kv = owner_row_layout->shard_rows(kv, /*pad_value=*/0);
+  }
 
   const int64_t compress_ratio_i = static_cast<int64_t>(compress_ratio_);
-  torch::Tensor main_packed_projection;
+  torch::Tensor local_main_packed_projection;
   torch::Tensor index_packed_projection;
-  if (cp_enabled) {
-    if (cp_execution->gather_mode() == CpProjectionGatherMode::BUNDLED) {
-      std::vector<torch::Tensor> local_projections;
-      if (compress_ratio_i > 1 && compressor_) {
-        local_projections.emplace_back(compressor_->project(hidden_states));
-      }
-      if (compress_ratio_i == 4 && indexer_) {
-        local_projections.emplace_back(indexer_->project_kv(hidden_states));
-      }
-      if (!local_projections.empty()) {
-        std::vector<torch::Tensor> global_projections =
-            cp_execution->gather_projection_bundle(cp_plan.row_layout(),
-                                                   local_projections);
-        main_packed_projection = global_projections.front();
-        if (compress_ratio_i == 4) {
-          CHECK_EQ(global_projections.size(), 2);
-          index_packed_projection = global_projections[1];
-        }
-      }
-    } else if (compress_ratio_i > 1 && compressor_) {
-      torch::Tensor local_main_projection = compressor_->project(hidden_states);
-      main_packed_projection = cp_execution->gather_global_rows(
-          cp_plan.row_layout(), local_main_projection);
+  if (owner_cp_enabled && compress_ratio_i > 1 && compressor_ &&
+      !use_owner_fused_decode) {
+    local_main_packed_projection = compressor_->project(owner_local_hidden);
+    CHECK_EQ(local_main_packed_projection.size(0),
+             owner_row_layout->local_padded_token_count())
+        << "DeepSeek V4 CP main projection lost local-padded rows";
+  }
+  if (model_rows_are_sharded) {
+    if (local_main_packed_projection.defined()) {
+      CHECK_EQ(local_main_packed_projection.size(0),
+               cp_plan.local_padded_token_count())
+          << "DeepSeek V4 CP main projection lost local-padded rows";
+    }
+    if (cp_execution->gather_mode() == CpProjectionGatherMode::BUNDLED &&
+        compress_ratio_i == 4 && indexer_) {
+      const torch::Tensor local_index_projection =
+          indexer_->project_kv(hidden_states);
+      const std::vector<torch::Tensor> global_projections =
+          cp_execution->gather_projection_bundle(cp_plan.row_layout(),
+                                                 {local_index_projection});
+      CHECK_EQ(global_projections.size(), 1);
+      index_packed_projection = global_projections.front();
     }
 
     kv = cp_execution->gather_global_rows(cp_plan.row_layout(), kv);
     CHECK_EQ(kv.size(0), cp_plan.global_real_token_count())
         << "DeepSeek V4 CP SWA KV gather lost global rows";
-    if (main_packed_projection.defined()) {
-      CHECK_EQ(main_packed_projection.size(0),
-               cp_plan.global_real_token_count())
-          << "DeepSeek V4 CP main projection gather lost global rows";
-    }
     if (index_packed_projection.defined()) {
       CHECK_EQ(index_packed_projection.size(0),
                cp_plan.global_real_token_count())
@@ -835,6 +1122,73 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     index_score_state = kv_cache.get_compress_index_score_state();
   }
 
+  auto cmp_kv = kv_cache.get_k_cache();
+  std::optional<Dsv4CpOwnershipPlan> cp_ownership_plan;
+  std::optional<Dsv4CpRouteDescriptor> cp_swa_route;
+  std::optional<Dsv4CpAttentionExchange> cp_owner_exchange;
+  if (owner_cp_enabled) {
+    CHECK(ori_kv.defined());
+    CHECK_GE(ori_kv.dim(), 2);
+    Dsv4CpOwnershipPlanner ownership_planner;
+    if (compress_ratio_i > 1) {
+      CHECK(cmp_kv.defined());
+      CHECK(compressor_kv_state.defined());
+      CHECK(compressor_score_state.defined());
+      CHECK_GE(cmp_kv.dim(), 2);
+      CHECK_GE(compressor_kv_state.dim(), 2);
+      CHECK_EQ(ori_kv.size(1), compressor_kv_state.size(1))
+          << "DSV4 SWA and compressor state must share one block layout";
+
+      const torch::Tensor state_global_block_table = get_layer_cache_tensor(
+          attn_metadata.host_block_tables,
+          attn_metadata.layer_id,
+          mapping.kv_state_cache_idx);
+      const torch::Tensor compressed_global_block_table =
+          get_layer_cache_tensor(attn_metadata.host_block_tables,
+                                 attn_metadata.layer_id,
+                                 mapping.cmp_cache_idx);
+      CHECK(state_global_block_table.defined())
+          << "DSV4 CP owner planning requires the host state block table";
+      CHECK(compressed_global_block_table.defined())
+          << "DSV4 CP owner planning requires the host compressed block table";
+
+      cp_ownership_plan.emplace(ownership_planner.build(
+          *owner_row_layout,
+          *global_q_seq_lens,
+          *global_kv_seq_lens,
+          state_global_block_table,
+          compressed_global_block_table,
+          compress_ratio_i,
+          compressor_kv_state.size(1),
+          cmp_kv.size(1),
+          hidden_states.device(),
+          Dsv4CpCacheAddressing::REPLICATED));
+      cp_swa_route = cp_ownership_plan->swa_route();
+    } else {
+      const torch::Tensor swa_global_block_table = get_layer_cache_tensor(
+          attn_metadata.host_block_tables,
+          attn_metadata.layer_id,
+          mapping.ori_cache_idx);
+      CHECK(swa_global_block_table.defined())
+          << "DSV4 C1 owner planning requires the host SWA block table";
+      cp_swa_route.emplace(ownership_planner.build_swa_route(
+          *owner_row_layout,
+          *global_q_seq_lens,
+          *global_kv_seq_lens,
+          swa_global_block_table,
+          ori_kv.size(1),
+          hidden_states.device(),
+          Dsv4CpCacheAddressing::REPLICATED));
+    }
+    cp_owner_exchange.emplace(owner_cp_group);
+
+    const torch::Tensor owner_swa_rows = cp_owner_exchange->route_owner_rows(
+        local_kv.reshape({local_kv.size(0), -1}).contiguous(),
+        cp_swa_route.value());
+    Dsv4CpAttentionExchange::write_received_cache_rows(
+        ori_kv, owner_swa_rows, cp_swa_route.value());
+  }
+
   // 5) Prepare ori_kv for attention.
   // Full prefill can read a temporary PA_ND cache built from current KV.
   // Chunked prefill needs prefix KV, so it reads the persistent SWA cache.
@@ -854,14 +1208,18 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(ori_kv_for_attn.defined())
         << "Failed to build PA_ND KV for DeepSeek V4 prefill attention.";
   } else {
-    scatter_by_slot(ori_kv, ori_slot, kv, /*require_exact_rows=*/cp_enabled);
+    if (!cp_swa_route.has_value()) {
+      scatter_by_slot(ori_kv,
+                      ori_slot,
+                      kv,
+                      /*require_exact_rows=*/model_rows_are_sharded);
+    }
     ori_kv_for_attn = ori_kv;
   }
 
   // 6) optional compressor for cmp cache
   // Token compressed cache is PA_ND for both prefill and decode.
   torch::Tensor cmp_kv_for_attn;
-  auto cmp_kv = kv_cache.get_k_cache();
   if (compress_ratio_i > 1 && compressor_ && cmp_kv.defined() &&
       cmp_slot.defined() && compressor_kv_state.defined() &&
       compressor_score_state.defined()) {
@@ -881,19 +1239,57 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
         kv_block_table, score_block_table};
 
     torch::Tensor compressed_kv;
-    if (cp_enabled) {
-      CHECK(main_packed_projection.defined());
-      compressed_kv =
-          compressor_->forward_core(attn_metadata,
-                                    main_packed_projection,
-                                    compressor_states,
-                                    compressor_block_tables,
-                                    compress_sin,
-                                    compress_cos,
-                                    attn_metadata.actual_seq_lengths_query);
-      if (cp_execution->gather_mode() == CpProjectionGatherMode::SEQUENTIAL) {
-        main_packed_projection = torch::Tensor();
+    if (owner_cp_enabled) {
+      CHECK(cp_ownership_plan.has_value());
+      CHECK(cp_owner_exchange.has_value());
+      const Dsv4CpOwnerMetadata& owner_metadata =
+          cp_ownership_plan->owner_metadata();
+      torch::Tensor owner_compressor_input =
+          cp_owner_exchange->route_owner_rows(
+              use_owner_fused_decode ? owner_local_hidden
+                                     : local_main_packed_projection,
+              cp_ownership_plan->main_route());
+      if (owner_metadata.real_row_count == 0) {
+        CHECK_EQ(owner_metadata.output_row_count, 0);
+        compressed_kv = torch::empty(
+            {0, cmp_kv.size(cmp_kv.dim() - 1)}, cmp_kv.options());
+      } else {
+        torch::Tensor owner_compress_sin =
+            Dsv4CpAttentionExchange::select_owner_output_rows(
+                compress_sin, owner_metadata);
+        torch::Tensor owner_compress_cos =
+            Dsv4CpAttentionExchange::select_owner_output_rows(
+                compress_cos, owner_metadata);
+        std::tuple<torch::Tensor, torch::Tensor> owner_block_tables{
+            owner_metadata.local_state_block_table,
+            owner_metadata.local_state_block_table};
+        if (use_owner_fused_decode) {
+          compressed_kv = compressor_->forward_owner_decode(
+              owner_metadata,
+              owner_compressor_input,
+              compressor_states,
+              owner_block_tables,
+              owner_compress_sin,
+              owner_compress_cos);
+        } else {
+          compressed_kv = compressor_->forward_owner_core(
+              owner_metadata,
+              owner_compressor_input,
+              compressor_states,
+              owner_block_tables,
+              owner_compress_sin,
+              owner_compress_cos);
+        }
       }
+
+      const torch::Tensor received_compressed_kv =
+          cp_owner_exchange->route_owner_rows(
+              compressed_kv,
+              cp_ownership_plan->compressed_cache_route());
+      Dsv4CpAttentionExchange::write_received_cache_rows(
+          cmp_kv,
+          received_compressed_kv,
+          cp_ownership_plan->compressed_cache_route());
     } else {
       compressed_kv =
           compressor_->forward(attn_metadata,
@@ -903,17 +1299,15 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                                compress_sin,
                                compress_cos,
                                attn_metadata.actual_seq_lengths_query);
+      scatter_by_slot(cmp_kv,
+                      cmp_slot,
+                      compressed_kv,
+                      /*require_exact_rows=*/false);
     }
-    scatter_by_slot(
-        cmp_kv, cmp_slot, compressed_kv, /*require_exact_rows=*/cp_enabled);
     cmp_kv_for_attn = cmp_kv;
   }
 
   torch::Tensor compress_topk_idxs;
-  torch::Tensor cp_index_query;
-  torch::Tensor cp_index_weights;
-  torch::Tensor cp_index_cache;
-  torch::Tensor cp_index_cache_scale;
   if (compress_ratio_i == 4 && cmp_kv.defined()) {
     auto index_cache = kv_cache.get_index_cache();
     std::optional<torch::Tensor> indexer_cache_scale =
@@ -934,7 +1328,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(qli_metadata.defined()) << "DSAttention requires precomputed "
                                      "qli_metadata for compress_ratio==4.";
     auto qli_metadata_opt = std::optional<torch::Tensor>(qli_metadata);
-    if (cp_enabled) {
+    if (model_rows_are_sharded) {
       if (cp_execution->gather_mode() == CpProjectionGatherMode::SEQUENTIAL) {
         torch::Tensor local_index_projection =
             indexer_->project_kv(hidden_states);
@@ -953,19 +1347,112 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       if (cp_execution->gather_mode() == CpProjectionGatherMode::SEQUENTIAL) {
         index_packed_projection = torch::Tensor();
       }
-      cp_index_query = indexer_->prepare_query(qr,
-                                               qr_pertoken_scale,
-                                               indexer_metadata,
-                                               preprocess_cos,
-                                               preprocess_sin);
-      cp_index_weights = indexer_->build_weights(hidden_states);
       indexer_->update_kv_cache(precomputed_index_kv,
                                 index_cache,
                                 &indexer_cache_scale_tensor,
                                 indexer_metadata,
                                 /*require_exact_rows=*/true);
-      cp_index_cache = index_cache;
-      cp_index_cache_scale = indexer_cache_scale_tensor;
+
+      // Each cache owner scores only its compressed index blocks. Global
+      // query rows are one-token virtual sequences so compacting owner blocks
+      // does not change the causal boundary of an earlier prefill query.
+      torch::Tensor global_hidden = cp_execution->gather_global_rows(
+          cp_plan.row_layout(), hidden_states);
+      torch::Tensor global_qr =
+          cp_execution->gather_global_rows(cp_plan.row_layout(), qr);
+      std::optional<torch::Tensor> global_qr_scale;
+      if (qr_pertoken_scale.has_value()) {
+        global_qr_scale = cp_execution->gather_global_rows(
+            cp_plan.row_layout(), qr_pertoken_scale.value());
+      }
+      torch::Tensor global_index_query = indexer_->prepare_query(global_qr,
+                                                                 global_qr_scale,
+                                                                 indexer_metadata,
+                                                                 cos,
+                                                                 sin);
+      torch::Tensor global_index_weights =
+          indexer_->build_weights(global_hidden);
+      const torch::Tensor index_global_block_table = get_layer_cache_tensor(
+          attn_metadata.host_block_tables,
+          attn_metadata.layer_id,
+          mapping.index_cache_idx);
+      CHECK(index_global_block_table.defined())
+          << "DSV4 CP owner QLI requires the host index block table";
+      const Dsv4CpOwnerQliMetadata owner_qli_metadata =
+          Dsv4CpAttentionExchange::build_owner_qli_metadata(
+              index_global_block_table,
+              cp_plan.global_q_seq_lens(),
+              cp_plan.global_kv_seq_lens(),
+              index_cache.size(1),
+              compress_ratio_i,
+              cp_plan.size(),
+              cp_plan.rank(),
+              global_index_query.device(),
+              Dsv4CpCacheAddressing::REPLICATED);
+      CHECK_EQ(owner_qli_metadata.query_sequence_indices.numel(),
+               global_index_query.size(0));
+
+      DeepseekV4QliResult local_candidates;
+      if (owner_qli_metadata.valid_query_row_count > 0) {
+        const torch::Tensor safe_key_seq_lens = torch::where(
+            owner_qli_metadata.valid_query_rows,
+            owner_qli_metadata.local_key_seq_lens,
+            torch::full_like(owner_qli_metadata.local_key_seq_lens,
+                             compress_ratio_i));
+        const int64_t max_owner_key_seq_len = std::max<int64_t>(
+            owner_qli_metadata.max_local_key_seq_len, compress_ratio_i);
+        const torch::Tensor owner_qli_tiling_metadata =
+            indexer_->build_qli_metadata(global_index_query,
+                                         owner_qli_metadata.query_seq_endpoints,
+                                         safe_key_seq_lens,
+                                         /*max_query_len=*/1,
+                                         max_owner_key_seq_len);
+        local_candidates = indexer_->select_qli_candidates(
+            global_index_query,
+            global_index_weights,
+            index_cache,
+            &indexer_cache_scale_tensor,
+            owner_qli_metadata.query_seq_endpoints,
+            safe_key_seq_lens,
+            owner_qli_metadata.query_block_table,
+            owner_qli_tiling_metadata);
+        torch::Tensor valid_rows =
+            owner_qli_metadata.valid_query_rows.view({-1, 1, 1});
+        local_candidates.indices = torch::where(
+            valid_rows,
+            local_candidates.indices,
+            torch::full_like(local_candidates.indices, -1));
+        local_candidates.scores = torch::where(
+            valid_rows,
+            local_candidates.scores,
+            torch::full_like(local_candidates.scores,
+                             -std::numeric_limits<float>::infinity()));
+      } else {
+        const std::vector<int64_t> candidate_shape = {
+            global_index_query.size(0), index_cache.size(2), index_topk_};
+        local_candidates.indices = torch::full(
+            candidate_shape,
+            -1,
+            global_index_query.options().dtype(torch::kInt32));
+        local_candidates.scores = torch::full(
+            candidate_shape,
+            -std::numeric_limits<float>::infinity(),
+            global_index_query.options().dtype(torch::kFloat32));
+      }
+
+      local_candidates.indices =
+          Dsv4CpAttentionExchange::map_owner_local_indices_to_global(
+              local_candidates.indices,
+              owner_qli_metadata.query_sequence_indices,
+              owner_qli_metadata.index_map);
+      CHECK(cp_owner_exchange.has_value());
+      const Dsv4CpQliMergeResult global_candidates =
+          cp_owner_exchange->global_topk(local_candidates.indices,
+                                         local_candidates.scores,
+                                         index_topk_);
+      compress_topk_idxs = global_candidates.indices;
+      CHECK(compress_topk_idxs.defined())
+          << "DSAttention owner QLI returned undefined topk indices.";
     } else {
       compress_topk_idxs =
           indexer_->select_qli(hidden_states,
@@ -1002,108 +1489,267 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   torch::Tensor attn_output;
   torch::Tensor output_lse;
-  if (cp_enabled) {
-    auto run_half = [&](const Dsv4CpHalfMetadata& half_metadata) {
-      if (half_metadata.real_row_count == 0) {
-        return torch::Tensor();
+  if (owner_cp_enabled) {
+    const std::vector<int32_t>& owner_global_q_seq_lens =
+        *global_q_seq_lens;
+    const std::vector<int32_t>& owner_global_kv_seq_lens =
+        *global_kv_seq_lens;
+    const torch::Tensor global_q =
+        model_rows_are_sharded
+            ? cp_execution->gather_global_rows(*owner_row_layout, local_q)
+            : q;
+    const int32_t owner_cp_size = owner_row_layout->cp_size();
+    const int32_t owner_cp_rank = owner_row_layout->cp_rank();
+
+    Dsv4CpOwnerPaCache owner_ori = build_dsv4_cp_owner_pa_cache(
+        ori_kv_for_attn,
+        ori_block_table_for_attn,
+        owner_global_kv_seq_lens,
+        owner_cp_size,
+        owner_cp_rank,
+        Dsv4CpBlockTableHolePolicy::SKIP_EVICTED);
+    const int64_t owner_sparse_capacity = std::min<int64_t>(
+        1024,
+        std::max<int64_t>(512,
+                          (std::max<int64_t>(window_size_, 1) +
+                           owner_cp_size * ori_kv_for_attn.size(1) - 1) /
+                              (owner_cp_size * ori_kv_for_attn.size(1)) *
+                              ori_kv_for_attn.size(1)));
+    const torch::Tensor owner_ori_indices = make_owner_window_indices(
+        owner_global_q_seq_lens,
+        owner_global_kv_seq_lens,
+        owner_ori.global_to_local,
+        std::max<int64_t>(window_size_ - 1, 0),
+        owner_sparse_capacity,
+        global_q.device());
+
+    std::optional<Dsv4CpOwnerPaCache> owner_cmp;
+    std::optional<torch::Tensor> owner_cmp_indices;
+    int64_t cmp_topk = 0;
+    if (compress_ratio_i > 1) {
+      CHECK(cmp_kv_for_attn.defined());
+      CHECK(cmp_block_table.defined());
+      std::vector<int32_t> global_cmp_seq_lens;
+      global_cmp_seq_lens.reserve(owner_global_kv_seq_lens.size());
+      for (int32_t length : owner_global_kv_seq_lens) {
+        global_cmp_seq_lens.emplace_back(
+            static_cast<int32_t>(length / compress_ratio_i));
       }
-      torch::Tensor half_q =
-          local_q.index_select(/*dim=*/0, half_metadata.pack_indices);
-      torch::Tensor half_topk;
+      owner_cmp.emplace(build_dsv4_cp_owner_pa_cache(
+          cmp_kv_for_attn,
+          cmp_block_table,
+          global_cmp_seq_lens,
+          owner_cp_size,
+          owner_cp_rank,
+          Dsv4CpBlockTableHolePolicy::REJECT));
+      const int64_t cmp_capacity = std::min<int64_t>(
+          1024, std::max<int64_t>(512, index_topk_));
+      // C4 uses the QLI-selected compressed-token bucket. C128 uses the
+      // operator's CFA path and its zero cmp_topk means that the compressed
+      // cache is consumed in full; the owner index tensor remains present to
+      // describe the rank-local physical cache layout.
+      cmp_topk = compress_ratio_i == 4 ? cmp_capacity : 0;
       if (compress_ratio_i == 4) {
-        CHECK(cp_index_query.defined());
-        CHECK(cp_index_weights.defined());
-        CHECK(cp_index_cache.defined());
-        CHECK(cp_index_cache_scale.defined());
-        AttentionMetadata half_indexer_metadata =
-            build_cp_half_indexer_metadata(attn_metadata,
-                                           half_metadata,
-                                           index_block_table,
-                                           torch::Tensor());
-        torch::Tensor half_index_query = cp_index_query.index_select(
-            /*dim=*/0, half_metadata.pack_indices);
-        torch::Tensor half_index_weights = cp_index_weights.index_select(
-            /*dim=*/0, half_metadata.pack_indices);
-        torch::Tensor half_hidden = hidden_states.index_select(
-            /*dim=*/0, half_metadata.pack_indices);
-        torch::Tensor half_qr =
-            qr.index_select(/*dim=*/0, half_metadata.pack_indices);
-        torch::Tensor empty_kv = torch::empty({0}, half_index_query.options());
-        half_topk = indexer_->select_qli(half_hidden,
-                                         half_qr,
-                                         /*qr_pertoken_scale=*/std::nullopt,
-                                         cp_index_cache,
-                                         &cp_index_cache_scale,
-                                         half_indexer_metadata,
-                                         /*cos=*/std::nullopt,
-                                         /*sin=*/std::nullopt,
-                                         /*compressed_cos=*/std::nullopt,
-                                         /*compressed_sin=*/std::nullopt,
-                                         half_metadata.q_cu_seq_lens,
-                                         half_metadata.kv_seq_lens,
-                                         half_metadata.qli_metadata,
-                                         /*with_prefill=*/true,
-                                         /*compressor_states=*/nullptr,
-                                         /*compressor_block_tables=*/nullptr,
-                                         empty_kv,
-                                         half_index_query,
-                                         half_index_weights);
+        CHECK(compress_topk_idxs.defined());
+        const torch::Tensor compressed_global_block_table =
+            get_layer_cache_tensor(attn_metadata.host_block_tables,
+                                   attn_metadata.layer_id,
+                                   mapping.cmp_cache_idx);
+        CHECK(compressed_global_block_table.defined())
+            << "DSV4 CP owner attention requires the host compressed block "
+               "table";
+        const Dsv4CpOwnerIndexMap compressed_index_map =
+            Dsv4CpAttentionExchange::build_owner_index_map(
+                compressed_global_block_table,
+                global_cmp_seq_lens,
+                cmp_kv_for_attn.size(1),
+                owner_cp_size,
+                owner_cp_rank,
+                global_q.device());
+        const torch::Tensor query_sequence_indices =
+            Dsv4CpAttentionExchange::build_query_sequence_indices(
+                owner_global_q_seq_lens, global_q.device());
+        torch::Tensor local_candidates =
+            Dsv4CpAttentionExchange::map_global_indices_to_owner_local(
+                compress_topk_idxs,
+                query_sequence_indices,
+                compressed_index_map);
+        local_candidates =
+            Dsv4CpAttentionExchange::compact_valid_indices(local_candidates);
+        const int64_t local_candidate_count =
+            local_candidates.size(local_candidates.dim() - 1);
+        if (local_candidate_count < cmp_capacity) {
+          std::vector<int64_t> padding_shape = local_candidates.sizes().vec();
+          padding_shape.back() = cmp_capacity - local_candidate_count;
+          local_candidates = torch::cat(
+              {local_candidates,
+               torch::full(padding_shape, -1, local_candidates.options())},
+              /*dim=*/local_candidates.dim() - 1);
+        } else if (local_candidate_count > cmp_capacity) {
+          local_candidates = local_candidates.slice(
+              /*dim=*/local_candidates.dim() - 1,
+              /*start=*/0,
+              /*end=*/cmp_capacity);
+        }
+        owner_cmp_indices = local_candidates.to(torch::kInt32).contiguous();
+      } else {
+        owner_cmp_indices = make_owner_compressed_indices(
+            owner_global_q_seq_lens,
+            owner_global_kv_seq_lens,
+            owner_cmp->global_to_local,
+            compress_ratio_i,
+            cmp_capacity,
+            /*global_candidates=*/torch::Tensor(),
+            global_q.device());
       }
-
-      torch::Tensor half_ori_block_table =
-          select_active_sequences(ori_block_table_for_attn, half_metadata);
-      torch::Tensor half_cmp_block_table =
-          select_active_sequences(cmp_block_table, half_metadata);
-      torch::Tensor local_sparse_metadata =
-          half_sparse_metadata(half_metadata, compress_ratio_i);
-      CHECK(local_sparse_metadata.defined());
-      return std::get<0>(xllm::kernel::npu::sparse_attn_sharedkv(
-          /*q=*/half_q,
-          /*ori_kv=*/as_optional(ori_kv_for_attn),
-          /*cmp_kv=*/compress_ratio_i > 1 ? as_optional(cmp_kv_for_attn)
-                                          : std::nullopt,
-          /*ori_sparse_indices=*/std::nullopt,
-          /*cmp_sparse_indices=*/compress_ratio_i == 4 ? as_optional(half_topk)
-                                                       : std::nullopt,
-          /*ori_block_table=*/as_optional(half_ori_block_table),
-          /*cmp_block_table=*/compress_ratio_i > 1
-              ? as_optional(half_cmp_block_table)
-              : std::nullopt,
-          /*cu_seqlens_q=*/as_optional(half_metadata.q_cu_seq_lens),
-          /*cu_seqlens_ori_kv=*/std::nullopt,
-          /*cu_seqlens_cmp_kv=*/std::nullopt,
-          // TND query lengths are described by cu_seqlens_q. The current
-          // SparseAttnSharedkv kernel rejects a non-null seqused_q input.
-          /*seqused_q=*/std::nullopt,
-          /*seqused_kv=*/as_optional(half_metadata.kv_seq_lens),
-          /*sinks=*/attn_sink_loaded_ ? as_optional(attn_sink_) : std::nullopt,
-          /*metadata=*/as_optional(local_sparse_metadata),
-          /*softmax_scale=*/softmax_scale_,
-          /*cmp_ratio=*/compress_ratio_i,
-          /*ori_mask_mode=*/4,
-          /*cmp_mask_mode=*/3,
-          /*ori_win_left=*/std::max<int64_t>(window_size_ - 1, 0),
-          /*ori_win_right=*/0,
-          /*layout_q=*/"TND",
-          /*layout_kv=*/ori_kv_layout,
-          /*return_softmax_lse=*/false));
-    };
-
-    attn_output = torch::zeros(
-        {cp_plan.local_padded_token_count(), n_local_heads_, head_dim_},
-        local_q.options());
-    torch::Tensor front_output = run_half(cp_metadata->front);
-    if (front_output.defined()) {
-      attn_output.index_copy_(
-          /*dim=*/0, cp_metadata->front.pack_indices, front_output);
     }
-    torch::Tensor back_output = run_half(cp_metadata->back);
-    if (back_output.defined()) {
-      attn_output.index_copy_(
-          /*dim=*/0, cp_metadata->back.pack_indices, back_output);
+
+    torch::Tensor owner_partial_output = torch::zeros_like(global_q);
+    torch::Tensor owner_partial_lse = torch::full(
+        {global_q.size(0), global_q.size(1), 1},
+        -std::numeric_limits<float>::infinity(),
+        global_q.options().dtype(torch::kFloat32));
+    const bool owner_has_ori_keys =
+        owner_ori.local_seq_lens.numel() > 0 &&
+        owner_ori.local_seq_lens.max().item<int64_t>() > 0;
+    const bool owner_has_cmp_keys =
+        owner_cmp.has_value() && owner_cmp->local_seq_lens.numel() > 0 &&
+        owner_cmp->local_seq_lens.max().item<int64_t>() > 0;
+    torch::Tensor owner_sinks = torch::full(
+        {n_local_heads_},
+        std::numeric_limits<float>::lowest(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(global_q.device()));
+    const bool owner_has_sink = attn_sink_loaded_ && owner_cp_rank == 0;
+    if (owner_has_sink) {
+      owner_sinks.copy_(attn_sink_);
     }
-    cos = preprocess_cos;
-    sin = preprocess_sin;
+    if (owner_has_ori_keys || owner_has_cmp_keys) {
+      if (cp_tensor_debug_enabled(attn_metadata.layer_id)) {
+        const int32_t debug_cp_rank = owner_cp_rank;
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "global_q",
+                              global_q);
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_ori_cache",
+                              owner_ori.cache);
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_cmp_cache",
+                              owner_cmp.has_value()
+                                  ? owner_cmp->cache
+                                  : torch::Tensor());
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_ori_indices",
+                              owner_ori_indices);
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_cmp_indices",
+                              owner_cmp_indices.has_value()
+                                  ? owner_cmp_indices.value()
+                                  : torch::Tensor());
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_ori_block_table",
+                              owner_ori.block_table);
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_cmp_block_table",
+                              owner_cmp.has_value()
+                                  ? owner_cmp->block_table
+                                  : torch::Tensor());
+        log_cp_tensor_summary(
+            attn_metadata.layer_id,
+            debug_cp_rank,
+            "owner_attention_input",
+            "cu_seqlens_q",
+            make_global_cumulative_lengths(owner_global_q_seq_lens,
+                                           global_q.device()));
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "owner_local_seq_lens",
+                              owner_ori.local_seq_lens);
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_input",
+                              "sinks",
+                              owner_sinks);
+      }
+      std::tie(owner_partial_output, owner_partial_lse) =
+          xllm::kernel::npu::sparse_attn_sharedkv_owner(
+              global_q,
+              owner_ori.cache,
+              owner_cmp.has_value() ? std::optional<torch::Tensor>(
+                                          owner_cmp->cache)
+                                    : std::nullopt,
+              owner_ori_indices,
+              owner_cmp_indices,
+              owner_ori.block_table,
+              owner_cmp.has_value() ? std::optional<torch::Tensor>(
+                                          owner_cmp->block_table)
+                                    : std::nullopt,
+              make_global_cumulative_lengths(owner_global_q_seq_lens,
+                                             global_q.device()),
+              owner_ori.local_seq_lens,
+              owner_sinks,
+              owner_sparse_capacity,
+              cmp_topk,
+              compress_ratio_i,
+              softmax_scale_,
+              std::max<int64_t>(window_size_ - 1, 0));
+      if (cp_tensor_debug_enabled(attn_metadata.layer_id)) {
+        const int32_t debug_cp_rank = owner_cp_rank;
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_output",
+                              "owner_partial_output",
+                              owner_partial_output);
+        log_cp_tensor_summary(attn_metadata.layer_id,
+                              debug_cp_rank,
+                              "owner_attention_output",
+                              "owner_partial_lse",
+                              owner_partial_lse);
+      }
+    } else if (owner_has_sink) {
+      owner_partial_lse.copy_(
+          owner_sinks.view({1, n_local_heads_, 1})
+              .expand(owner_partial_lse.sizes()));
+    }
+
+    Dsv4CpAttentionExchange owner_exchange(owner_cp_group);
+    const Dsv4CpAttentionMergeResult merged =
+        owner_exchange.merge_attention_partials(owner_partial_output,
+                                                owner_partial_lse);
+    if (cp_tensor_debug_enabled(attn_metadata.layer_id)) {
+      log_cp_tensor_summary(attn_metadata.layer_id,
+                            owner_cp_rank,
+                            "owner_attention_merged",
+                            "merged_output",
+                            merged.output);
+      log_cp_tensor_summary(attn_metadata.layer_id,
+                            owner_cp_rank,
+                            "owner_attention_merged",
+                            "merged_lse",
+                            merged.lse);
+    }
+    attn_output = model_rows_are_sharded
+                      ? owner_row_layout->shard_rows(merged.output, 0)
+                      : merged.output;
+    output_lse = std::move(merged.lse);
+    if (model_rows_are_sharded) {
+      cos = preprocess_cos;
+      sin = preprocess_sin;
+    }
   } else {
     CHECK(sparse_metadata.has_value())
         << "DSAttention requires precomputed sparse metadata for "
@@ -1146,11 +1792,11 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   }
 
   // 8) Deferred cache write for full prefill.
-  if (use_temporary_prefill_kv) {
+  if (use_temporary_prefill_kv && !cp_swa_route.has_value()) {
     scatter_by_slot(ori_kv,
                     ori_slot,
                     kv,
-                    /*require_exact_rows=*/cp_enabled);
+                    /*require_exact_rows=*/model_rows_are_sharded);
   }
 
   // 9) output RoPE + projection

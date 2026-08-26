@@ -36,6 +36,34 @@ target_link_libraries(kv_cache_estimation_test
 
 cc_test(
   NAME
+    deepseek_v4_cp_cache_layout_test
+  SRCS
+    deepseek_v4_cp_cache_layout_test.cpp
+  DEPS
+    :deepseek_v4_cp_cache_layout
+    GTest::gtest_main
+)
+target_link_libraries(deepseek_v4_cp_cache_layout_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    deepseek_v4_cp_cache_migration_test
+  NO_NPU_RUNTIME
+  SRCS
+    deepseek_v4_cp_cache_migration_test.cpp
+  DEPS
+    :deepseek_v4_cp_cache_migration
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     kv_cache_test
   SRCS
     kv_cache_test.cpp

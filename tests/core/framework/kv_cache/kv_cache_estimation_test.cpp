@@ -404,4 +404,188 @@ TEST(KVCacheEstimationTest, SpeculativeDecodeUsesDraftShapeForTp1Body) {
             476);
 }
 
+TEST(KVCacheEstimationTest, Dsv4StateDtypeChangesOnlyStateBytes) {
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257)
+      .compress_ratios({1, 4, 128});
+
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kBFloat16;
+  options.block_size = 128;
+  options.max_seqs_per_batch = 4;
+
+  options.dsv4_compress_state_dtype = torch::kFloat32;
+  const Dsv4KVCacheEstimateCost fp32_cost =
+      estimate_dsv4_kv_cache_cost(model_args, options);
+  options.dsv4_compress_state_dtype = torch::kBFloat16;
+  const Dsv4KVCacheEstimateCost bf16_cost =
+      estimate_dsv4_kv_cache_cost(model_args, options);
+
+  EXPECT_EQ(fp32_cost.swa_count, bf16_cost.swa_count);
+  EXPECT_EQ(fp32_cost.token_unit_bytes, bf16_cost.token_unit_bytes);
+  const int64_t swa_bytes =
+      fp32_cost.swa_count * options.block_size * model_args.head_dim() *
+      static_cast<int64_t>(torch::elementSize(options.dtype)) *
+      model_args.n_layers();
+  const int64_t fp32_state_bytes = fp32_cost.constant_swa_bytes - swa_bytes;
+  const int64_t bf16_state_bytes = bf16_cost.constant_swa_bytes - swa_bytes;
+  EXPECT_GT(fp32_state_bytes, 0);
+  EXPECT_EQ(fp32_state_bytes, 2 * bf16_state_bytes);
+}
+
+TEST(KVCacheEstimationTest, Dsv4CpCapacityUsesExactWorstOwnerBytes) {
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257)
+      .compress_ratios({1, 4, 128});
+
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kBFloat16;
+  options.dsv4_compress_state_dtype = torch::kFloat32;
+  options.cache_size_in_bytes = 8 * 1024 * 1024;
+  options.block_size = 128;
+  options.max_seqs_per_batch = 4;
+  options.dsv4_cp_size = 8;
+
+  const KVCacheCapacity cp_capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  const Dsv4KVCacheEstimateCost cp_cost =
+      estimate_dsv4_kv_cache_cost(model_args, options);
+  const int64_t physical_bytes = dsv4_kv_cache_physical_bytes(
+      cp_cost, cp_capacity.c4_count(), cp_capacity.c128_count(), /*cp_rank=*/0);
+  EXPECT_LE(physical_bytes, options.cache_size_in_bytes);
+  EXPECT_GT(dsv4_kv_cache_physical_bytes(cp_cost,
+                                         cp_capacity.c4_count() + 32,
+                                         cp_capacity.c128_count() + 1,
+                                         /*cp_rank=*/0),
+            options.cache_size_in_bytes);
+
+  options.dsv4_cp_size = 1;
+  const KVCacheCapacity replicated_capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_GT(cp_capacity.n_blocks(), replicated_capacity.n_blocks());
+}
+
+TEST(KVCacheEstimationTest, Dsv4CpMtpCapacityAccountsIndependentPools) {
+  ModelArgs target_args;
+  target_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257)
+      .compress_ratios({1, 4, 128});
+  ModelArgs draft_args = target_args;
+  draft_args.model_type("deepseek_v4_mtp");
+
+  constexpr int64_t kCombinedBudget = 8 * 1024 * 1024;
+  KVCacheEstimateOptions target_options;
+  target_options.dtype = torch::kBFloat16;
+  target_options.dsv4_compress_state_dtype = torch::kFloat32;
+  target_options.cache_size_in_bytes = kCombinedBudget;
+  target_options.block_size = 128;
+  target_options.max_seqs_per_batch = 4;
+  target_options.dsv4_cp_size = 8;
+  KVCacheEstimateOptions draft_options = target_options;
+  target_options.draft_model_args = &draft_args;
+  target_options.draft_options = &draft_options;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(target_args, target_options);
+  const Dsv4KVCacheEstimateCost target_cost =
+      estimate_dsv4_kv_cache_cost(target_args, target_options);
+  const Dsv4KVCacheEstimateCost draft_cost =
+      estimate_dsv4_kv_cache_cost(draft_args, draft_options);
+  const int64_t target_bytes = dsv4_kv_cache_physical_bytes(
+      target_cost, capacity.c4_count(), capacity.c128_count(), /*cp_rank=*/0);
+  const int64_t draft_bytes = dsv4_kv_cache_physical_bytes(
+      draft_cost, capacity.c4_count(), capacity.c128_count(), /*cp_rank=*/0);
+  EXPECT_EQ(capacity.cache_size_in_bytes(), target_bytes);
+  EXPECT_LE(target_bytes + draft_bytes, kCombinedBudget);
+  EXPECT_GT(
+      dsv4_kv_cache_physical_bytes(target_cost,
+                                   capacity.c4_count() + 32,
+                                   capacity.c128_count() + 1,
+                                   /*cp_rank=*/0) +
+          dsv4_kv_cache_physical_bytes(draft_cost,
+                                       capacity.c4_count() + 32,
+                                       capacity.c128_count() + 1,
+                                       /*cp_rank=*/0),
+      kCombinedBudget);
+}
+
+TEST(KVCacheEstimationTest, Dsv4CpMtpAllowsFixedSwaOnlyDraft) {
+  ModelArgs target_args;
+  target_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257)
+      .compress_ratios({1, 4, 128});
+  ModelArgs draft_args;
+  draft_args.model_type("deepseek_v4_mtp")
+      .n_layers(1)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257);
+
+  constexpr int64_t kCombinedBudget = 8 * 1024 * 1024;
+  KVCacheEstimateOptions target_options;
+  target_options.dtype = torch::kBFloat16;
+  target_options.dsv4_compress_state_dtype = torch::kFloat32;
+  target_options.cache_size_in_bytes = kCombinedBudget;
+  target_options.block_size = 128;
+  target_options.max_seqs_per_batch = 4;
+  target_options.dsv4_cp_size = 8;
+  KVCacheEstimateOptions draft_options = target_options;
+  target_options.draft_model_args = &draft_args;
+  target_options.draft_options = &draft_options;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(target_args, target_options);
+  const Dsv4KVCacheEstimateCost target_cost =
+      estimate_dsv4_kv_cache_cost(target_args, target_options);
+  const Dsv4KVCacheEstimateCost draft_cost =
+      estimate_dsv4_kv_cache_cost(draft_args, draft_options);
+  EXPECT_GT(target_cost.token_unit_bytes, 0);
+  EXPECT_EQ(draft_cost.token_unit_bytes, 0);
+
+  const int64_t target_bytes = dsv4_kv_cache_physical_bytes(
+      target_cost, capacity.c4_count(), capacity.c128_count(), /*cp_rank=*/0);
+  const int64_t draft_bytes = dsv4_kv_cache_physical_bytes(
+      draft_cost, capacity.c4_count(), capacity.c128_count(), /*cp_rank=*/0);
+  EXPECT_EQ(capacity.cache_size_in_bytes(), target_bytes);
+  EXPECT_LE(target_bytes + draft_bytes, kCombinedBudget);
+}
+
+TEST(KVCacheEstimationTest, Dsv4MtpFixedSwaOnlyCapacityNeedsNoDynamicPool) {
+  ModelArgs draft_args;
+  draft_args.model_type("deepseek_v4_mtp")
+      .n_layers(1)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257);
+
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kBFloat16;
+  options.dsv4_compress_state_dtype = torch::kFloat32;
+  options.cache_size_in_bytes = 8 * 1024 * 1024;
+  options.block_size = 128;
+  options.max_seqs_per_batch = 4;
+  options.dsv4_cp_size = 8;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(draft_args, options);
+  EXPECT_GT(capacity.swa_count(), 0);
+  EXPECT_EQ(capacity.c4_count(), 0);
+  EXPECT_EQ(capacity.c128_count(), 0);
+  EXPECT_EQ(capacity.n_blocks(), 1);
+}
+
 }  // namespace xllm

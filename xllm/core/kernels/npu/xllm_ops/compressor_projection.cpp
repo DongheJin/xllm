@@ -46,7 +46,7 @@ torch::Tensor compressor_projection(const torch::Tensor& x,
 
   const int64_t token_count = x.numel() / x.size(x.dim() - 1);
   torch::Tensor packed_projection = torch::empty(
-      {token_count, 2 * wkv.size(0)}, x.options().dtype(torch::kFloat32));
+      {token_count, 2 * wkv.size(0)}, x.options());
   EXEC_NPU_CMD(
       aclnnCompressorProjection, x, wkv, wgate, coff, packed_projection);
   return packed_projection;

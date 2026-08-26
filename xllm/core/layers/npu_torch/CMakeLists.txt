@@ -2,6 +2,72 @@ include(cc_library)
 
 cc_library(
   NAME
+    deepseek_v4_cp_buffer_pool
+  HDRS
+    deepseek_v4_cp_buffer_pool.h
+  SRCS
+    deepseek_v4_cp_buffer_pool.cpp
+  DEPS
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
+    deepseek_v4_cp_wavefront
+  HDRS
+    deepseek_v4_cp_wavefront.h
+  SRCS
+    deepseek_v4_cp_wavefront.cpp
+  DEPS
+    glog::glog
+)
+
+cc_library(
+  NAME
+    deepseek_v4_cp_attention_exchange
+  HDRS
+    deepseek_v4_cp_attention_exchange.h
+    deepseek_v4_cp_buffer_pool.h
+    deepseek_v4_cp_wavefront.h
+  SRCS
+    deepseek_v4_cp_attention_exchange.cpp
+  DEPS
+    :deepseek_v4_cp_ownership
+    :parallel_state
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
+    deepseek_v4_cp_owner_attention
+  HDRS
+    deepseek_v4_cp_owner_attention.h
+  SRCS
+    deepseek_v4_cp_owner_attention.cpp
+  DEPS
+    :deepseek_v4_cp_attention_exchange
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
+    deepseek_v4_cp_ownership
+  HDRS
+    deepseek_v4_cp_ownership.h
+  SRCS
+    deepseek_v4_cp_ownership.cpp
+  DEPS
+    :deepseek_v4_cp_cache_layout
+    :parallel_state
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
     npu_torch_layers
   HDRS
     fused_moe.h
@@ -20,7 +86,10 @@ cc_library(
     deepseek_v4_eplb_utils.h
     deepseek_sparse_attention.h
     deepseek_v4_cp_execution.h
+    deepseek_v4_cp_attention_exchange.h
+    deepseek_v4_cp_owner_attention.h
     deepseek_v4_cp_metadata.h
+    deepseek_v4_cp_ownership.h
     compressor.h
     deepseek_v4_indexer.h
     deepseek_v4_gate.h
@@ -45,6 +114,11 @@ cc_library(
     deepseek_v4_gate.cpp
   DEPS
     :common_layers
+    :deepseek_v4_cp_attention_exchange
+    :deepseek_v4_cp_owner_attention
+    :deepseek_v4_cp_buffer_pool
+    :deepseek_v4_cp_wavefront
+    :deepseek_v4_cp_ownership
     :npu_layers
     :xllm_ops
     :triton_adapter

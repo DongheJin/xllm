@@ -83,13 +83,71 @@ TEST(FlashComm1ContextTest, EligibilityIsIndependentOfDpAndTpSize) {
                                        enabled_options(1200)));
 }
 
-TEST(FlashComm1ContextTest, ContextParallelRemainsIneligible) {
+TEST(FlashComm1ContextTest, LegacyInterfaceRejectsContextParallel) {
   EXPECT_FALSE(is_flash_comm1_eligible(/*num_tokens=*/1000,
                                        /*is_prefill=*/true,
                                        make_parallel_args(/*world_size=*/32,
                                                           /*dp_size=*/4,
                                                           /*cp_size=*/2),
                                        enabled_options()));
+}
+
+TEST(FlashComm1ContextTest, CpAwareGeometryUsesGlobalThreshold) {
+  const ParallelArgs cp4_tp2 = make_parallel_args(/*world_size=*/8,
+                                                  /*dp_size=*/1,
+                                                  /*cp_size=*/4);
+  FlashComm1TokenGeometry geometry{
+      .global_num_tokens = 8192,
+      .local_num_tokens = 2048,
+  };
+
+  EXPECT_TRUE(is_flash_comm1_eligible(geometry,
+                                      /*is_prefill=*/true,
+                                      cp4_tp2,
+                                      enabled_options(/*min_prefill_tokens=*/8192)));
+
+  geometry.global_num_tokens = 8191;
+  EXPECT_FALSE(is_flash_comm1_eligible(
+      geometry,
+      /*is_prefill=*/true,
+      cp4_tp2,
+      enabled_options(/*min_prefill_tokens=*/8192)));
+}
+
+TEST(FlashComm1ContextTest, CpAwareGeometryRejectsEmptyCpRank) {
+  const ParallelArgs cp4_tp2 = make_parallel_args(/*world_size=*/8,
+                                                  /*dp_size=*/1,
+                                                  /*cp_size=*/4);
+  const FlashComm1TokenGeometry geometry{
+      .global_num_tokens = 8192,
+      .local_num_tokens = 2048,
+      .cp_has_empty_rank = true,
+  };
+
+  EXPECT_FALSE(is_flash_comm1_eligible(geometry,
+                                       /*is_prefill=*/true,
+                                       cp4_tp2,
+                                       enabled_options()));
+}
+
+TEST(FlashComm1ContextTest, CpAwareGeometryRequiresAlignedShardPerTpRank) {
+  const ParallelArgs cp2_tp4 = make_parallel_args(/*world_size=*/8,
+                                                  /*dp_size=*/1,
+                                                  /*cp_size=*/2);
+  FlashComm1TokenGeometry geometry{
+      .global_num_tokens = 1000,
+      .local_num_tokens = 63,
+  };
+
+  EXPECT_FALSE(is_flash_comm1_eligible(geometry,
+                                       /*is_prefill=*/true,
+                                       cp2_tp4,
+                                       enabled_options()));
+  geometry.local_num_tokens = 64;
+  EXPECT_TRUE(is_flash_comm1_eligible(geometry,
+                                      /*is_prefill=*/true,
+                                      cp2_tp4,
+                                      enabled_options()));
 }
 
 TEST(FlashComm1ContextTest, ScopePublishesAndRestoresContext) {

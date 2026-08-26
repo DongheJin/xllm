@@ -100,6 +100,9 @@ class DSAttentionImpl : public torch::nn::Module {
   int64_t n_local_groups_;
   int64_t tp_rank_ = 0;
   int64_t tp_size_ = 1;
+  int32_t cp_size_ = 1;
+  int32_t cp_rank_ = 0;
+  ProcessGroup* cp_group_ = nullptr;
   int64_t index_n_heads_ = 0;
   int64_t index_head_dim_ = 0;
   int64_t index_topk_ = 0;

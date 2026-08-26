@@ -2,6 +2,74 @@ include(cc_test)
 
 cc_test(
   NAME
+    deepseek_v4_cp_wavefront_test
+  NO_NPU_RUNTIME
+  SRCS
+    deepseek_v4_cp_wavefront_test.cpp
+  DEPS
+    :deepseek_v4_cp_wavefront
+    glog::glog
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v4_cp_buffer_pool_test
+  NO_NPU_RUNTIME
+  SRCS
+    deepseek_v4_cp_buffer_pool_test.cpp
+  DEPS
+    :deepseek_v4_cp_buffer_pool
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v4_cp_attention_exchange_test
+  NO_NPU_RUNTIME
+  SRCS
+    deepseek_v4_cp_attention_exchange_test.cpp
+  DEPS
+    :deepseek_v4_cp_attention_exchange
+    :deepseek_v4_cp_ownership
+    :parallel_state
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v4_cp_owner_attention_test
+  NO_NPU_RUNTIME
+  SRCS
+    deepseek_v4_cp_owner_attention_test.cpp
+  DEPS
+    :deepseek_v4_cp_attention_exchange
+    :deepseek_v4_cp_owner_attention
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v4_cp_ownership_test
+  NO_NPU_RUNTIME
+  SRCS
+    deepseek_v4_cp_ownership_test.cpp
+  DEPS
+    :deepseek_v4_cp_ownership
+    :parallel_state
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     deepseek_v4_cp_execution_test
   SRCS
     deepseek_v4_cp_execution_test.cpp
@@ -16,6 +84,7 @@ cc_test(
 cc_test(
   NAME
     deepseek_v4_cp_metadata_test
+  NO_NPU_RUNTIME
   SRCS
     deepseek_v4_cp_metadata_test.cpp
   DEPS

@@ -17,8 +17,11 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/process_group.h"
+#include "layers/npu_torch/deepseek_v4_eplb_utils.h"
 
 namespace xllm::layer {
 namespace {
@@ -34,6 +37,7 @@ Dsv4CpMemoryBudgetConfig base_config() {
   config.hidden_size = 7168;
   config.model_dtype_size = 2;
   config.collective_workspace_bytes = 4096;
+  config.moe_operator_workspace_bytes = 8192;
   config.requires_moe_bridge = true;
   return config;
 }
@@ -71,11 +75,12 @@ TEST(Dsv4CpMemoryBudgetEstimatorTest, AccountsBundledProjectionPeak) {
   const Dsv4CpMemoryBudget budget =
       Dsv4CpMemoryBudgetEstimator::estimate(config);
 
-  EXPECT_EQ(budget.local_projection_bytes, 8 * (2048 + 512) * 4);
-  EXPECT_EQ(budget.global_projection_bytes, 32 * (2048 + 512) * 4);
+  EXPECT_EQ(budget.local_projection_bytes, 8 * (2048 + 512) * 2);
+  EXPECT_EQ(budget.global_projection_bytes, 32 * (2048 + 512) * 2);
   EXPECT_GT(budget.projection_gather_bytes, budget.global_projection_bytes);
   EXPECT_GT(budget.swa_gather_bytes, 32 * 512 * 2);
   EXPECT_GT(budget.moe_bridge_bytes, 2 * 32 * 7168 * 2);
+  EXPECT_EQ(budget.moe_operator_workspace_bytes, 8192);
   EXPECT_EQ(budget.required_bytes,
             budget.persistent_cache_bytes + budget.peak_transient_bytes);
 }
@@ -87,8 +92,8 @@ TEST(Dsv4CpMemoryBudgetEstimatorTest, SequentialModeUsesLargestProjection) {
   const Dsv4CpMemoryBudget budget =
       Dsv4CpMemoryBudgetEstimator::estimate(config);
 
-  EXPECT_EQ(budget.local_projection_bytes, 8 * 2048 * 4);
-  EXPECT_EQ(budget.global_projection_bytes, 32 * 2048 * 4);
+  EXPECT_EQ(budget.local_projection_bytes, 8 * 2048 * 2);
+  EXPECT_EQ(budget.global_projection_bytes, 32 * 2048 * 2);
 
   Dsv4CpMemoryBudgetConfig bundled_config = base_config();
   bundled_config.gather_mode = CpProjectionGatherMode::BUNDLED;
@@ -188,6 +193,53 @@ TEST(Dsv4CpMemoryBudgetEstimatorTest,
   EXPECT_EQ(config.projection_widths, (std::vector<int64_t>{2048, 512}));
   EXPECT_EQ(config.swa_width, 512);
   EXPECT_TRUE(config.requires_moe_bridge);
+  EXPECT_EQ(config.moe_operator_workspace_bytes, 0);
+}
+
+TEST(Dsv4CpMemoryBudgetEstimatorTest,
+     ReservesDispatchFfnCombineWorkspaceFromCpLocalCapacity) {
+  constexpr int64_t kMiB = 1024 * 1024;
+  EXPECT_EQ(dsv4_eplb::dispatch_ffn_max_output_size(
+                /*local_tokens=*/3072,
+                /*topk=*/6,
+                /*ep_world_size=*/8),
+            147456);
+  EXPECT_EQ(dsv4_eplb::dispatch_ffn_workspace_reservation_bytes(
+                /*local_tokens=*/530,
+                /*topk=*/6,
+                /*ep_world_size=*/8,
+                /*hidden_size=*/4096,
+                /*local_experts=*/32),
+            316 * kMiB);
+}
+
+TEST(Dsv4CpMemoryBudgetEstimatorTest,
+     RejectsInvalidDispatchFfnCombineWorkspaceShape) {
+  EXPECT_EQ(dsv4_eplb::dispatch_ffn_workspace_reservation_bytes(
+                /*local_tokens=*/0,
+                /*topk=*/6,
+                /*ep_world_size=*/8,
+                /*hidden_size=*/4096,
+                /*local_experts=*/32),
+            0);
+  EXPECT_EQ(dsv4_eplb::dispatch_ffn_workspace_reservation_bytes(
+                std::numeric_limits<int64_t>::max(),
+                /*topk=*/6,
+                /*ep_world_size=*/8,
+                /*hidden_size=*/4096,
+                /*local_experts=*/32),
+            0);
+}
+
+TEST(Dsv4CpMemoryBudgetEstimatorTest,
+     IdentifiesW8A8DynamicQuantizationCaseInsensitively) {
+  EXPECT_TRUE(
+      dsv4_eplb::is_w8a8_dynamic_quantize_type("w8a8_dynamic"));
+  EXPECT_TRUE(
+      dsv4_eplb::is_w8a8_dynamic_quantize_type("W8A8_DYNAMIC"));
+  EXPECT_FALSE(
+      dsv4_eplb::is_w8a8_dynamic_quantize_type("w4a8_dynamic"));
+  EXPECT_FALSE(dsv4_eplb::is_w8a8_dynamic_quantize_type(""));
 }
 
 TEST(Dsv4CpExecutionContextTest, BundledProjectionUsesOneCollective) {
@@ -196,9 +248,9 @@ TEST(Dsv4CpExecutionContextTest, BundledProjectionUsesOneCollective) {
   Dsv4CpExecutionContext context(&process_group,
                                  CpProjectionGatherMode::BUNDLED);
   const torch::Tensor first =
-      torch::ones({layout.local_padded_token_count(), 2}, torch::kFloat32);
+      torch::ones({layout.local_padded_token_count(), 2}, torch::kBFloat16);
   const torch::Tensor second =
-      torch::ones({layout.local_padded_token_count(), 3}, torch::kFloat32);
+      torch::ones({layout.local_padded_token_count(), 3}, torch::kBFloat16);
 
   const std::vector<torch::Tensor> outputs =
       context.gather_projection_bundle(layout, {first, second});
@@ -208,6 +260,8 @@ TEST(Dsv4CpExecutionContextTest, BundledProjectionUsesOneCollective) {
   EXPECT_EQ(outputs[1].sizes(), torch::IntArrayRef({4, 3}));
   EXPECT_TRUE(outputs[0].is_contiguous());
   EXPECT_TRUE(outputs[1].is_contiguous());
+  EXPECT_EQ(outputs[0].scalar_type(), torch::kBFloat16);
+  EXPECT_EQ(outputs[1].scalar_type(), torch::kBFloat16);
   EXPECT_EQ(process_group.allgather_calls(), 1);
 }
 
@@ -217,9 +271,9 @@ TEST(Dsv4CpExecutionContextTest, SequentialProjectionUsesOrderedCollectives) {
   Dsv4CpExecutionContext context(&process_group,
                                  CpProjectionGatherMode::SEQUENTIAL);
   const torch::Tensor first =
-      torch::ones({layout.local_padded_token_count(), 2}, torch::kFloat32);
+      torch::ones({layout.local_padded_token_count(), 2}, torch::kBFloat16);
   const torch::Tensor second =
-      torch::ones({layout.local_padded_token_count(), 3}, torch::kFloat32);
+      torch::ones({layout.local_padded_token_count(), 3}, torch::kBFloat16);
 
   const std::vector<torch::Tensor> outputs =
       context.gather_projection_bundle(layout, {first, second});
@@ -227,6 +281,8 @@ TEST(Dsv4CpExecutionContextTest, SequentialProjectionUsesOrderedCollectives) {
   ASSERT_EQ(outputs.size(), 2);
   EXPECT_EQ(outputs[0].sizes(), torch::IntArrayRef({4, 2}));
   EXPECT_EQ(outputs[1].sizes(), torch::IntArrayRef({4, 3}));
+  EXPECT_EQ(outputs[0].scalar_type(), torch::kBFloat16);
+  EXPECT_EQ(outputs[1].scalar_type(), torch::kBFloat16);
   EXPECT_EQ(process_group.allgather_calls(), 2);
 }
 

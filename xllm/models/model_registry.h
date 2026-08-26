@@ -81,6 +81,7 @@ struct NpuModelCpCapability {
   bool supports_mtp_prefill = false;
   bool requires_kv_split_one = false;
   bool requires_split_compressor = false;
+  bool requires_owner_sparse_attention = false;
 };
 
 // TODO: add default args loader.

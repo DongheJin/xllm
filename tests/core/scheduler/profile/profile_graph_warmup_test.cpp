@@ -89,6 +89,20 @@ TEST(GraphWarmupTest, AllowsAllBucketsSkipped) {
   EXPECT_TRUE(buckets.empty());
 }
 
+TEST(GraphWarmupTest, CapsBatchBySingleDpCacheCapacity) {
+  EXPECT_EQ(graph_decode_batch_capacity(
+                /*configured_max_batch_size=*/8,
+                /*fresh_sequence_capacities=*/{7}),
+            7);
+}
+
+TEST(GraphWarmupTest, CapsBatchForRoundRobinDpAssignment) {
+  EXPECT_EQ(graph_decode_batch_capacity(
+                /*configured_max_batch_size=*/8,
+                /*fresh_sequence_capacities=*/{2, 3}),
+            4);
+}
+
 TEST(GraphWarmupTest, PrefillRoleUsesPrefillOnlyPlan) {
   EXPECT_EQ(graph_warmup_plan(InstanceRole::PREFILL),
             GraphWarmupPlan::PREFILL_ONLY);

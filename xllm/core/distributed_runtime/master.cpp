@@ -191,11 +191,10 @@ std::optional<std::string> validate_model_cp(const Options& options,
     if (cp_capability.metadata_policy ==
             CpMetadataPolicy::MODEL_MANAGED_GLOBAL_CACHE &&
         (global_world_size != 8 || options.dp_size() != 1 ||
-         options.cp_size() != 8 || attn_tp_size != 1 ||
          options.ep_size() != 8)) {
-      return "DeepSeek V4 NPU CP first release requires "
-             "world_size=8, dp_size=1, cp_size=8, attention_tp_size=1, "
-             "ep_size=8";
+      return "DeepSeek V4 NPU CP requires world_size=8, dp_size=1, "
+             "ep_size=8, and an orthogonal cp_size * attention_tp_size = 8 "
+             "topology";
     }
     if (cp_capability.metadata_policy ==
             CpMetadataPolicy::MODEL_MANAGED_GLOBAL_CACHE &&

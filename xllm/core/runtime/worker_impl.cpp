@@ -27,6 +27,7 @@ limitations under the License.
 #include "acl/acl.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "layers/npu_torch/deepseek_v4_cp_execution.h"
+#include "layers/npu_torch/deepseek_v4_eplb_utils.h"
 #elif defined(USE_MLU)
 #include <framework/core/caching_allocator.h>
 #elif defined(USE_CUDA) || defined(USE_ILU)
@@ -56,6 +57,7 @@ limitations under the License.
 #include "core/framework/config/profile_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/platform/platform.h"
 #include "core/platform/sleepable_allocator.h"
@@ -81,6 +83,7 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
+#include "kernels/ops_api.h"
 #include "models/model_registry.h"
 #include "runtime/forward_params.h"
 #if defined(USE_NPU)
@@ -454,6 +457,11 @@ bool WorkerImpl::allocate_kv_cache_storage(
     ssm_dtype = resolve_ssm_dtype(args.mamba_ssm_dtype(), dtype_);
   }
 
+  const auto dsv4_state_dtype = parse_dsv4_compress_state_dtype(
+      ::xllm::KVCacheConfig::get_instance().dsv4_compress_state_dtype());
+  CHECK(dsv4_state_dtype.has_value())
+      << "Invalid DeepSeek V4 compressor state dtype";
+
   KVCacheCreateOptions create_options;
   create_options.device(device_)
       .dtype(dtype_)
@@ -475,6 +483,12 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .index_head_dim(std::max(args.index_head_dim(), 1))
       .window_size(std::max(args.window_size(), 1))
       .compress_ratios(args.compress_ratios());
+  create_options.dsv4_compress_state_dtype(
+      dsv4_compress_state_torch_dtype(*dsv4_state_dtype));
+  if (util::is_deepseek_v4_model_type(args.model_type())) {
+    LOG(INFO) << "[DSV4][KVCacheInit] compressor state dtype="
+              << dsv4_compress_state_dtype_name(*dsv4_state_dtype);
+  }
 #if defined(USE_NPU)
   create_options.enable_kv_cache_huge_page_allocator(use_huge_page_allocator);
 #endif
@@ -645,7 +659,7 @@ std::tuple<int64_t, int64_t> WorkerImpl::estimate_kv_cache_capacity() {
                                                     cp_runtime_config.cp_group);
 
     const ModelArgs& model_args = context_.get_model_args();
-    const layer::Dsv4CpMemoryBudgetConfig budget_config =
+    layer::Dsv4CpMemoryBudgetConfig budget_config =
         layer::Dsv4CpMemoryBudgetEstimator::make_worst_case_config(
             model_args,
             options_.max_tokens_per_batch(),
@@ -653,6 +667,37 @@ std::tuple<int64_t, int64_t> WorkerImpl::estimate_kv_cache_capacity() {
             parallel_args_.cp_size(),
             torch::elementSize(dtype_),
             /*requires_moe_bridge=*/model_args.n_routed_experts() > 0);
+    const QuantArgs& quant_args = context_.get_quant_args();
+    const int64_t moe_ep_size =
+        parallel_args_.moe_ep_group_ != nullptr
+            ? parallel_args_.moe_ep_group_->world_size()
+            : parallel_args_.ep_size();
+    const bool moe_tp_size_is_one =
+        parallel_args_.moe_tp_group_ != nullptr
+            ? parallel_args_.moe_tp_group_->world_size() == 1
+            : parallel_args_.tp_size() == 1;
+    const bool uses_dispatch_ffn_combine =
+        model_args.n_routed_experts() > 0 &&
+        EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
+        KernelConfig::get_instance().enable_fused_mc2() == 1 &&
+        moe_ep_size > 1 && moe_tp_size_is_one &&
+        layer::dsv4_eplb::is_w8a8_dynamic_quantize_type(
+            quant_args.quantize_type()) &&
+        kernel::has_dispatch_ffn_combine();
+    if (uses_dispatch_ffn_combine) {
+      CHECK_EQ(model_args.n_routed_experts() % moe_ep_size, 0)
+          << "DispatchFFNCombine requires routed experts to be divisible by "
+             "the MoE EP group size.";
+      budget_config.moe_operator_workspace_bytes =
+          layer::dsv4_eplb::dispatch_ffn_workspace_reservation_bytes(
+              budget_config.local_padded_token_count,
+              model_args.num_experts_per_tok(),
+              moe_ep_size,
+              model_args.hidden_size(),
+              model_args.n_routed_experts() / moe_ep_size);
+      CHECK_GT(budget_config.moe_operator_workspace_bytes, 0)
+          << "Failed to estimate DispatchFFNCombine workspace.";
+    }
     int64_t utilization_reserved_bytes = 0;
     if (options_.max_memory_utilization() < 1.0) {
       utilization_reserved_bytes = static_cast<int64_t>(
@@ -670,6 +715,8 @@ std::tuple<int64_t, int64_t> WorkerImpl::estimate_kv_cache_capacity() {
               << projection_gather_mode_name(decision.gather_mode)
               << ", persistent_owned_by_kv_estimator=true"
               << ", transient=" << decision.budget.peak_transient_bytes
+              << ", moe_operator_workspace="
+              << decision.budget.moe_operator_workspace_bytes
               << ", available_before_reserve="
               << cache_available_memory + decision.budget.peak_transient_bytes
               << ", available_for_kv=" << cache_available_memory;
@@ -697,7 +744,10 @@ ForwardInput WorkerImpl::prepare_inputs(Batch& batch) {
 bool WorkerImpl::can_prepare_npu_graph_decode_input(
     const ModelInputParams& input_params) const {
 #if defined(USE_NPU)
-  return !options_.enable_speculative_decode() &&
+  const bool uses_dsv4_owner_cp =
+      parallel_args_.cp_size() > 1 &&
+      util::is_deepseek_v4_model_type(context_.get_model_args().model_type());
+  return !uses_dsv4_owner_cp && !options_.enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
          enable_schedule_overlap() && options_.backend() == "llm" &&
@@ -829,14 +879,11 @@ const CpPlanRuntimeConfig& WorkerImpl::npu_cp_plan_runtime_config() const {
     return npu_cp_runtime_config_;
   }
   CpPlanRuntimeConfig cfg;
-  // NpuCpPlan is the ATB-side CP substrate: it emits cp_ep_meta for ATB graph
-  // nodes and reads attn tp/cp widths out of MappingNPU's json, which only the
-  // ATB branch populates. TORCH models (deepseek_v4) own their CP split inside
-  // the model, so the worker must not shard a second time here -- and must not
-  // reach the mapping CHECK below with an empty mapping.
+  // NpuCpPlan owns model-row sharding for both ATB and model-managed TORCH CP.
+  // TORCH models retain global cache metadata and consume only the row layout;
+  // ATB models additionally consume cp_ep_meta and localized cache metadata.
   cfg.enabled =
       parallel_args_.cp_size() > 1 && Platform::uses_model_cp_sharding() &&
-      ::xllm::KernelConfig::get_instance().npu_kernel_backend() == "ATB" &&
       owns_npu_cp_plan_build() && model_supports_model_cp();
   cfg.has_prefix_slots =
       KVCacheConfig::get_instance().enable_prefix_cache() ||
@@ -854,6 +901,12 @@ const CpPlanRuntimeConfig& WorkerImpl::npu_cp_plan_runtime_config() const {
           << "NPU CP for model_type=" << resolved_name
           << " requires CompressorProjection and CompressorCore custom "
              "operators";
+    }
+    if (cp_capability.requires_owner_sparse_attention) {
+      CHECK(kernel::npu::has_owner_sparse_attention())
+          << "NPU CP for model_type=" << resolved_name
+          << " requires SparseAttnSharedkvMetadata and SparseAttnSharedkv "
+             "custom operators with owner-index support";
     }
     cfg.model_managed_global_cache =
         cp_capability.metadata_policy ==
@@ -1039,7 +1092,13 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // CP prepare after global attention-meta consumers.
     processed_input.input_params.parallel.cp_plan.prepare(
         processed_input, npu_cp_plan_runtime_config());
-    if (processed_input.input_params.parallel.cp_plan.enabled()) {
+    const bool uses_dsv4_owner_cp =
+        parallel_args_.cp_size() > 1 &&
+        util::is_deepseek_v4_model_type(
+            context_.get_model_args().model_type());
+    if (processed_input.input_params.parallel.cp_plan.enabled() ||
+        (uses_dsv4_owner_cp &&
+         processed_input.input_params.meta.batch_forward_type.has_decode())) {
       processed_input.input_params.enable_graph = false;
     }
 
@@ -1219,6 +1278,15 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
       }
 
       const auto output = this->step_for_schedule_overlap(input);
+#if defined(USE_NPU)
+      if (output.has_value() && !output->sample_output.next_tokens.defined() &&
+          output->ready_event != nullptr &&
+          (output->retained_input != nullptr ||
+           !output->retained_input_dependencies.empty())) {
+        CHECK(output->ready_event->synchronize())
+            << "failed to retire asynchronous output without tokens";
+      }
+#endif
       if (output.has_value()) {
         if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
           std::unique_lock<std::mutex> lock(mtx_);

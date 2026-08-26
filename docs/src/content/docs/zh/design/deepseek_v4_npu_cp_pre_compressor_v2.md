@@ -1,16 +1,17 @@
 ---
-title: "DeepSeek-V4 NPU Prefill CP Pre-Compressor V2 设计"
+title: "DeepSeek-V4 NPU CP 分布式 Compressor 完整设计"
 sidebar:
   order: 10
 ---
 
 ## 1. 摘要
 
-本文给出 DeepSeek-V4（DSV4）NPU Torch 后端 Prefill Context Parallelism
-的重新实现方案。方案采用 **projection-first pre-compressor**：模型 hidden 按 CP
-切分后，各 rank 先完成本地无状态 projection，只在 stateful compressor core 之前恢复
-全局 packed projection。每个 CP rank 维护完整逻辑 cache 和 compressor state，Query、QLI 和
-sparse attention 仅处理本 rank 的 token。
+本文给出 DeepSeek-V4（DSV4）NPU Torch 后端完整 Context Parallelism 方案。现有
+**projection-first replicated pre-compressor** 已完成正确性闭环，作为 reference path
+保留；当前目标升级为 **sharded state-owner**：模型 hidden 按 CP 切分后，各 rank 完成本地
+无状态 projection，只将目标压缩窗口及边界 halo 路由到唯一 state owner。owner 执行局部
+compressor core 并独占对应 compressor state、SWA/compressed/index cache shard；Query、QLI
+和 sparse attention 通过分布式 partial output/LSE 合并访问全局逻辑 cache。
 
 本方案不新增第二套 token owner 规划器。现有 `NpuCpPlan` 继续提供 `2 * cp_size`
 zigzag row layout，但需要把通用 row layout 与 ATB 专用 attention/KV-split metadata
@@ -21,19 +22,24 @@ Query、causal KV endpoint 和 sparse/QLI metadata。
 
 1. 不 AllGather normalized hidden。
 2. main compressor 和 indexer compressor 都拆成无状态 projection 与 stateful core。
-3. projected SWA KV、main projection 和 indexer projection 在进入 cache/stateful core
-   前恢复为 global-real 顺序。
-4. Cache 不按 CP 切分，强制 `kv_split_size_effective == 1`。
+3. main/index projection 保持 model dtype，并按 compression-window owner 路由；不再恢复
+   每个 rank 都持有的 global-real projection。
+4. Compressor state、SWA KV、compressed KV 和 index cache 按 CP owner 分片；逻辑 block
+   table 保持 global 语义，物理 tensor 只保存本 rank shard。
 5. Compressor padding row 永远不能进入 stateful core 或 cache write。
 6. MoE 是否能直接消费 CP-local token 由明确 capability 决定，不能只靠 token count
    metadata 推断。
-7. CP 只参与 prefill 类 forward；decode 可继续使用 ACL Graph，CP prefill 本身走 eager。
+7. CP 同时参与 prefill 和 decode 的分布式 cache/state 路径；prefill 在固定 bucket 和稳定
+   buffer address 下支持 ACL Graph capture/replay。
+8. 层内 projection/routing/attention 通信使用固定双缓冲；跨 layer 采用有依赖约束的
+   wavefront pipeline，禁止覆盖仍被 Graph 或 HCCL 使用的 buffer。
 
 ## 2. 设计状态和代码基线
 
-- 文档状态：V2 设计已冻结；Task 0-8 的代码、标准 NPU 构建和聚焦单测已完成，Task 9
-  的首版 8 卡正确性、SHM、有界稳定性和长输入性能门禁已完成。完整正交拓扑矩阵、
-  msprof 分层数据和长时间 soak 作为发布扩展验证继续执行。
+- 文档状态：replicated reference path 的 Task 0-9 已完成。当前文档已解除首版范围，
+  state/cache 分片、state-owner/halo、CP prefill Graph 和跨 layer overlap 全部升级为当前
+  版本目标；Task 10 正在实施，Task 11-14 尚未完成，不得把 reference path 的结果作为
+  完整版本结论。
 - 代码基线：`upstream/main`，提交 `e69351b4`。
 - 目标后端：NPU Torch。
 - 目标模型：`deepseek_v4`、`deepseek_v4_mtp`。
@@ -59,60 +65,61 @@ replica 汇总。
 3. 支持 chunked prefill 和 prefix cache continuation。
 4. 支持 DSV4 MTP prefill，并保证 target/draft 使用同一 row ownership。
 5. 支持正交 `DP x CP x attention-TP` 拓扑。
-6. 保持 decode、非 CP、现有 fused compressor 路径不变。
+6. 非 CP 路径保持不变；CP decode 使用 owner-local state/cache update 和分布式 attention，
+   FP32 reference 模式继续用于差分。
 7. 通过 zigzag 切分改善 causal attention 负载均衡。
 8. 将 CP 编排限制在 row layout、DSV4 adapter 和 compressor 接口内，不把模型细节
    扩散到 scheduler、cache manager 或通用 collective。
 
-## 4. 非目标
+## 4. 当前版本强制范围
 
-1. 第一版不做 compressor state 或 KV cache 的 CP 分片。
-2. 第一版不实现 post-compressor halo/state-owner 方案。
-3. 第一版不在 CP prefill 内执行 ACL Graph capture/replay。
-4. 第一版不做跨 layer 的计算通信 overlap。
+以下四项全部是当前版本交付目标，不再属于非目标或条件升级项：
 
-上述四项经过首版闭环重新评估后均不升级为实现前置项：
-
-| 项目 | 首版结论 | 原因 |
+| 项目 | 当前版本结论 | 必须解决的问题 |
 | --- | --- | --- |
-| compressor state/KV cache CP 分片 | 后续容量特性 | replicated state/cache 不影响 CP8 正确性；通过启动 HBM 门禁控制可运行范围 |
-| post-compressor halo/state-owner | 后续替代算法 | 会改变 state owner、halo 通信和 decode cache 语义，不能与 pre-compressor 首版混合实现 |
-| CP prefill ACL Graph | 后续性能优化 | collective、动态 real-row shape 和临时 tensor 地址尚未纳入稳定 graph key；首版 eager 可保证正确性 |
-| 跨 layer overlap | 后续性能优化 | 需要双缓冲、stream/event 生命周期和额外峰值预算，不应阻塞单层正确性闭环 |
+| compressor state/KV cache CP 分片 | P0 数据模型 | 每 rank 只分配 owner-local state/cache；capacity estimator、prefix/swap/transfer 和 block mapping 同步支持 |
+| state-owner/halo | P0 执行模型 | projection rows 按 compression window 路由到唯一 owner，owner-local core 消除 replicated 重算 |
+| CP prefill ACL Graph | P1 执行优化 | bucket、dtype、topology、buffer address 和 collective 顺序进入稳定 graph identity |
+| 跨 layer overlap | P1 执行优化 | 固定双缓冲、stream/event 所有权和 microchunk wavefront 依赖必须可证明且可观测 |
 
-以上范围不表示忽略相关运行时问题。第一版必须同时满足以下 P0 约束：
+四项之间存在硬依赖：Graph 和 overlap 必须建立在最终 sharded cache/state ABI 与稳定 buffer
+pool 之上；不得先 capture replicated reference path 再把 capture 结果复用于 state-owner
+path。当前版本必须同时满足以下约束：
 
-1. CP-active prefill 显式走 eager，pure decode 继续使用现有 ACL Graph；不能依赖模型内部
-   偶然绕过 graph。
-2. DSV4 decode 的 cache layout、state 更新和 fused compressor 保持不变，并由显式 phase
-   dispatch 隔离 split prefill 路径。
-3. 启动时验证 `compressor_projection` 和 `compressor_core` capability；缺少任一算子时
-   fail-fast，不允许静默切换为 gather global hidden 或 post-compressor。
-4. 启动时在现有 KV capacity estimator 之前预留最大 prefill bucket 的 CP 临时显存；
-   HCCL persistent buffer 必须在 free-memory 快照前完成初始化，AllGather 输出、concat、
-   projection 和 MoE bridge tensor 必须计入峰值并限制在单次 forward 作用域内。
-   `ProcessGroup` 不提供调用方持有的 collective workspace。
+1. `REPLICATED_REFERENCE` 只用于差分、诊断和显式回滚，不是 production capability 的静默
+   fallback。`SHARDED_STATE_OWNER` 缺少任一 op/collective 时启动失败。
+2. cache owner 由 canonical global physical block id 纯函数确定：
+   `owner = global_block_id % cp_size`、`local_block = global_block_id / cp_size`。compression
+   window owner 从其 state/cache block table 派生，不由当前 batch row 或临时 padding决定；
+   prefix reuse 保留同一 global block id，swap/transfer 必须显式迁移 owner。
+3. 每个 state/cache slot 只有一个写 owner。其他 rank 不分配同一数据副本，也不能通过
+   all-reduce 合并多个写结果。
+4. C4/C128 compression window 跨 owner 边界时，仅路由完成该窗口所需的 projection halo；
+   padding/dummy row 不进入 owner core 或 state update。
+5. Sharded cache 上的 QLI/sparse attention 使用 local partial result 与 FP32 LSE 合并恢复
+   global attention，不允许临时 AllGather 完整 KV cache。
+6. CP prefill eager 继续作为 graph 差分基线；Graph 模式使用固定容量 tensor 和 device-side
+   real-count metadata，不 capture allocator、host shape branch 或变化地址。
+7. Overlap 只能跨越数据依赖允许的阶段。双缓冲 slot 在 producer event 完成前不可复用；
+   Graph capture/replay 和 eager 使用同一 ownership state machine。
+8. 启动容量门禁同时核算 owner-local persistent cache/state、Graph 固定 buffer、双缓冲和
+   HCCL persistent memory；不得通过关闭门禁换取启动成功。
 
-Cache 分片是条件升级项：第一版默认以降低 prefill 延迟/提升吞吐为目标，不承诺通过 CP
-扩大单卡 cache capacity。若发布目标要求在当前 A3 HBM 预算内支持 1M context 和目标并发，
-而完整 cache replica 无法通过容量门禁，则 KV cache 分片必须升级为独立 P0 设计，不能以
-临时关闭门禁代替。
+### 4.1 当前版本消除的 reference-path 下界
 
-### 4.1 首版接受的性能非最优点（后续优化）
+| Reference path 问题 | 当前版本实现 |
+| --- | --- |
+| `compressor_core` 在 P 个 rank 上对 global rows 重算 | projection owner routing + owner-local core，每个 compression window 只执行一次 |
+| FP32 global projection AllGather | projection 直接以 model dtype 路由到 owner；Core tile 内升 FP32 |
+| cache/state 每 rank 完整复制 | owner-local physical cache/state，容量按 CP size 扩展并扣除 metadata/对齐开销 |
+| CP prefill 固定 eager | 稳定 bucket/buffer/collective identity 后 capture/replay，eager 保留为 reference |
+| collective 与计算串行 | 双缓冲和 microchunk wavefront overlap，保留严格 collective sequence id |
 
-与 PR #2097「layer 末对完整 hidden 做 all-gather」相比，本方案把 gather 前移到
-compressor projection 之后、core 之前（§7.2）。这一取舍换来 projection 局部计算与更小的
-gather 宽度，但引入两项已知的性能非最优点。二者均不影响首版正确性，作为后续优化项记录，
-不升级为实现前置项：
-
-| 项目 | 首版结论 | 后续优化方向 |
-| --- | --- | --- |
-| `compressor_core` replicated 重算 | 每个 CP rank 对 global-real 全序列冗余重算 core，compute 不随 CP 摊薄（见 §17 `T_replicated_compressor_core`） | 与非目标第 1 项（compressor state/KV cache CP 分片）一并推进：state 分片后 core 可按 CP 局部计算，消除 N 重冗余 |
-| projection gather 通信量 | gather 对象为 FP32 packed projection；C4 因 `coff=2` 宽度翻倍，且每层可能多次 collective，带宽非最优 | 评估 gather wire 降精度（BF16 传输、core 侧按 §6.2 要求升回 FP32）与合并 collective（§8.5 bundle）次数；须与 FP32 精度约束一并权衡 |
-
-需要说明的是：projection 局部计算已消除 #2097 中 projection 的 N 重冗余，`compressor_core`
-与 attention 的相对开销两方案一致，因此上述两项是本方案在 compressor 路径上**剩余**的优化空间，
-而非相对 #2097 的净劣化。
+与 PR #2097 相比，本方案仍不 AllGather normalized hidden。projection 本地计算后只发送
+owner 所需 rows/halo，既消除 projection 与 core 的 N 重计算，也不恢复完整 hidden 或完整
+packed projection。state-owner 是 replicated pre-compressor 的最终分布式执行 policy，
+不是并列的第二套 token ownership；token owner 仍来自 `CpRowLayout`，compression/cache
+owner 由独立纯函数从 global logical position 派生。
 
 ## 5. 当前实现
 
@@ -226,47 +233,23 @@ local projection
 
 在该等价测试通过前，不能开始多卡 CP 正确性验证。
 
-#### 已确认：Projection 输出为 FP32
+#### 当前目标：16-bit Projection Storage 与 FP32 Compute
 
-A3 融合算子已给出直接证据：
+A3 融合算子的 L0C accumulator 和 Vector 数值路径仍为 FP32，但这不要求 projection 以
+FP32 写入 GM。当前版本将 storage/transport 与 compute dtype 分离：
 
-- `ops-transformer` arch22 的 `CompressorBlockCubePerf` 定义
-  `using MM1_OUT_T = float`，并把 `x @ wkv`、`x @ wgate` 的 L0C 累加结果通过
-  `Fixpipe` 写入两个 FP32 GM workspace；
-- 当前 `xllm-ops` A3 Compressor 同样定义 `MM1_OUT_T = float`，其 workspace tiling
-  使用 4-byte element，并已按每个 branch 的 `[kv, score]` 顺序打包 MM1 结果；
-- `CompressorBlockVectorPerf` 以 FP32 读取 projection，完成 APE、overlap、state 更新和
-  softmax/reduce；split Core 输出 FP32 pre-norm，norm 和 RoPE 由 runtime finalize。
+- hidden、projection weight 和 packed projection 使用 model dtype；目标 DSV4 为 BF16；
+- Cube 使用 FP32 accumulate，Fixpipe 以 `F322BF16` 直接写 packed projection；
+- owner routing/halo 传输 BF16 projection，不创建完整 FP32 GM tensor；
+- Core tile load 后升 FP32，APE、overlap、softmax、reduce 和 state recurrence 保持 FP32；
+- compressor state storage 默认 FP32、可选 BF16，BF16 只发生在 state load/store 边界；
+- split Core 首版输出 FP32 pre-norm，RMSNorm/RoPE 完成后转 model dtype。
 
-因此 split operator 的稳定 tensor ABI 定为 FP32。这里的 tensor ABI 与
-`_GLIBCXX_USE_CXX11_ABI` 无关；当前 xLLM `setup.py` 根据 Torch 配置传入
-`-D_GLIBCXX_USE_CXX11_ABI=1`，现有 CMake configure log 和容器内 Torch 2.9 均确认值为
-1。CANN op-host/device 目标继续使用各自构建系统规定的 C++ ABI，不改变 projection
-tensor dtype。
-
-由于 projection 为 FP32，不能仅根据 feature width 判断 projection-first 的通信量更小。
-
-以一个示例配置为例：
-
-```text
-hidden_size       = 4096
-main head_dim     = 512
-index head_dim    = 128
-hidden/SWA dtype  = BF16
-projection dtype  = FP32
-```
-
-每 token collective payload 为：
-
-| Layer | Hidden BF16 | Projection-first payload | 结果 |
-| --- | ---: | ---: | --- |
-| C1 | 8192 B | SWA KV 1024 B | 明显更小 |
-| C4 | 8192 B | SWA 1024 B + main projection 8192 B + index projection 2048 B = 11264 B | 字节数更大 |
-| C128 | 8192 B | SWA 1024 B + main projection 4096 B = 5120 B | 更小 |
-
-Projection-first 仍可通过消除重复 GEMM 获得收益，但 C4 必须单独 profiling，不能预设
-收益。禁止仅为了减少通信将 projection 强制转换为 BF16，除非后续独立数值方案明确证明
-compressed output、state、cache 和端到端结果均等价；该降精度不属于第一版。
+这里的 tensor dtype 与 `_GLIBCXX_USE_CXX11_ABI` 无关；当前 xLLM C++ ABI 仍为 1。FP32
+reference operator 保留用于差分，但 production owner path 不执行 global projection
+AllGather。以 `H=4096,D=512,index_D=128` 为例，C4 main+index BF16 projection bundle 为
+每 token 5120 B；state-owner routing 的实际链路字节还取决于 owner 分布和边界 halo，必须
+记录 send/recv split，不能按 AllGather 公式估算。
 
 Correctness MoE bridge 是独立于 ratio 的额外预算：
 
@@ -300,15 +283,12 @@ DSV4 需要 global cache slot/block table，而现有 ATB CP 会改写 attention
 cache slots。仅增加 DSV4 条件分支会进一步加深耦合。应在 `NpuCpPlan` 内部拆出通用
 `CpRowLayout`，由不同 execution policy 选择后续 metadata 构建。
 
-#### P1：Graph 门禁应按 forward phase 判断
+#### P1：Graph identity 必须覆盖 CP owner path
 
-CP 只运行 prefill，而 DSV4 ACL Graph 主要服务 decode。启动时不应因为
-`enable_graph=true` 拒绝整个服务。正确策略是：
-
-- CP prefill eager；
-- pure decode 可 graph；
-- spec-verify chunked-prefill 显式 eager；
-- CP collective 不进入 graph capture。
+replicated reference path 已通过 phase gate 将 CP prefill 留在 eager。完整版本不再以该
+fallback 作为 production 行为：full/chunked/MTP prefill、decode 和 spec-verify 都必须使用
+最终 owner/cache layout 的 bucketed Graph。Graph identity、固定 buffer 和 collective
+sequence 约束见 §14；eager 仅作为相同 layout 的差分基线。
 
 #### P1：MTP 不能共享带 raw ProcessGroup 指针的 plan
 
@@ -333,13 +313,16 @@ global: [B0, B1, ..., B(P-1), BP, ..., B(2P-1)]
 rank r: [Br, B(2P-1-r)] + local padding
 ```
 
-运行时存在三种 row view：
+运行时存在以下 row/cache view：
 
 | View | dim 0 | 顺序 | 用途 |
 | --- | ---: | --- | --- |
-| local-padded | `Tp` | 每条 sequence 的 front/back + padding | layer、projection、collective input |
+| local-padded | `Tp` | 每条 sequence 的 front/back + padding | layer、projection、owner-routing input |
 | local-real-half | 当前 half 真实行 | active sequence 顺序 | QLI、sparse attention |
-| global-real | `T` | CP 切分前 batch 原序 | cache write、compressor core、model output |
+| owner-routed | 当前 owner 收到的 real rows + boundary halo | `(sequence, compression-window, offset)` canonical 顺序 | owner-local compressor core |
+| owner-local cache | 本 rank 拥有的 logical cache blocks/slots | local physical slot 顺序 | state/cache write、local attention partial |
+| query-local partial | 本 rank Query 对某个 cache shard 的 output/LSE | local-real-half 顺序 | 跨 rank FP32 LSE merge |
+| global-real reference | `T` | CP 切分前 batch 原序 | metadata、测试和最终 model output；不作为 production core/cache tensor |
 
 ### 7.2 每层执行流
 
@@ -349,22 +332,26 @@ flowchart TD
   A --> C[local projected SWA KV]
   A --> D[local main compressor projection]
   A --> E[local indexer compressor projection, C4 only]
-  C --> F[CP gather/reorder/unpad]
-  D --> G[CP gather/reorder/unpad]
-  E --> H[CP gather/reorder/unpad]
-  F --> I[global SWA cache/store]
-  G --> J[global main compressor core/state/cache]
-  H --> K[global indexer core/Hadamard/quant/cache]
+  C --> F[route rows to SWA cache owner]
+  D --> G[route compression windows + halo to state owner]
+  E --> H[route index windows + halo to state owner]
+  F --> I[owner-local SWA cache store]
+  G --> J[owner-local main core/state/compressed cache]
+  H --> K[owner-local index core/Hadamard/quant/cache]
   B --> L[pack front/back real Query]
-  I --> M[front/back QLI + sparse attention]
+  K --> Q[distributed QLI local candidates + global top-k]
+  I --> M[distributed sparse attention partial]
   J --> M
-  K --> M
+  Q --> M
   L --> M
-  M --> N[output projection]
+  M --> R[FP32 LSE merge across cache owners]
+  R --> N[output projection]
   N --> O[scatter to local-padded rows]
 ```
 
-所有 CP rank 必须先完成该层需要的 collective，之后才允许某个 rank 跳过空 half。
+所有 CP rank 使用相同的 `collective_sequence_id` 执行 owner routing、QLI candidate merge 和
+attention partial merge；empty owner/half 发送零 real-count 的固定容量 buffer，不能跳过
+collective。replicated reference path 保留原 global gather，只用于 eager 差分。
 
 ## 8. 模块边界
 
@@ -378,6 +365,7 @@ enum class CpMetadataPolicy : int8_t {
   NONE = 0,
   ATB_ATTENTION = 1,
   MODEL_MANAGED_GLOBAL_CACHE = 2,
+  MODEL_MANAGED_SHARDED_CACHE = 3,
 };
 
 struct NpuModelCpCapability {
@@ -385,7 +373,9 @@ struct NpuModelCpCapability {
   std::string required_backend;
   bool supports_dp = false;
   bool supports_mtp_prefill = false;
-  bool requires_full_kv_replica = false;
+  bool supports_sharded_cache = false;
+  bool supports_cp_prefill_graph = false;
+  bool supports_cp_overlap = false;
 };
 ```
 
@@ -396,10 +386,14 @@ required_backend          = TORCH
 metadata_policy           = MODEL_MANAGED_GLOBAL_CACHE
 supports_dp               = true
 supports_mtp_prefill      = true
-requires_full_kv_replica  = true
+supports_sharded_cache     = true
+supports_cp_prefill_graph  = true
+supports_cp_overlap        = true
 ```
 
-Master 根据 capability 校验 backend、DP、MTP 和 KV split。Worker 根据
+完整版本注册时 `metadata_policy` 必须改为 `MODEL_MANAGED_SHARDED_CACHE`；上表中的
+`MODEL_MANAGED_GLOBAL_CACHE` 仅表示当前 reference implementation 的状态。Master 根据
+capability 校验 backend、DP、MTP、cache owner 和 Graph/overlap。Worker 根据
 `metadata_policy` 决定 `NpuCpPlan::prepare()` 是否改写普通 attention metadata。
 
 ### 8.2 `NpuCpPlan` 内部拆分
@@ -411,6 +405,7 @@ NpuCpPlan
   ├── CpRowLayout               通用 zigzag row ownership
   ├── CpAttentionMeta           ATB attention 专用
   ├── CpEpMeta                  ATB/EP bridge 专用
+  ├── CpCompressionOwnership    DSV4 compression/cache owner 纯 value semantics
   └── CpOutputMergeMeta         可由 CpRowLayout 派生
 ```
 
@@ -441,6 +436,8 @@ class CpRowLayout final {
 - API 不理解 compressor、ratio、prefix cache 或 DSA；
 - 现有 `shard_model_input()`、`merge_model_output()` 保留为兼容 wrapper；
 - `MODEL_MANAGED_GLOBAL_CACHE` 下不执行普通 attention metadata 改写和 KV slot shard。
+- `MODEL_MANAGED_SHARDED_CACHE` 下由 DSV4 owner plan 生成 local physical slot 和通信 split，
+  不复用 ATB KV split metadata。
 
 ### 8.3 DSV4 typed CP metadata
 
@@ -490,26 +487,107 @@ Global `DSAMetadata` 保持以下内容不变：
 - multi-cache block tables/slot mappings；
 - compressor/indexer state metadata。
 
-### 8.4 Compressor API
+### 8.4 Compression/cache owner 和分布式 attention
+
+新增模块：
+
+```text
+xllm/core/layers/npu_torch/deepseek_v4_cp_ownership.*
+  Dsv4CpOwnershipPlan / Dsv4CpOwnershipPlanner
+
+xllm/core/framework/kv_cache/deepseek_v4_cp_cache_shard.*
+  global block id <-> owner/local block mapping
+
+xllm/core/layers/npu_torch/deepseek_v4_cp_attention_exchange.*
+  owner routing / distributed QLI / output+LSE merge
+
+xllm/core/layers/npu_torch/deepseek_v4_cp_buffer_pool.*
+  graph-stable double buffers / event state machine
+```
+
+核心 descriptor 只保存 value semantics：
+
+```cpp
+struct Dsv4CpRouteDescriptor {
+  torch::Tensor send_row_indices;
+  torch::Tensor send_owner_ranks;
+  torch::Tensor recv_sequence_ids;
+  torch::Tensor recv_window_ids;
+  torch::Tensor recv_window_offsets;
+  torch::Tensor recv_real_counts;
+  int64_t padded_rows_per_peer = 0;
+};
+
+class Dsv4CpOwnershipPlanner final {
+ public:
+  Dsv4CpOwnershipPlan build(
+      const CpRowLayout& row_layout,
+      const DSAMetadata& global_metadata,
+      int64_t compress_ratio,
+      int64_t block_size,
+      int64_t cp_size) const;
+};
+```
+
+owner mapping 规则：
+
+```text
+owner(global_block_id) = global_block_id % cp_size
+local_block(global_block_id) = global_block_id / cp_size
+```
+
+SWA、C4 compressed、C4 index 和 C128 compressed cache 都使用该映射。state window 使用
+对应 state block table 的 global block id，因此 full/chunked/prefix continuation 的同一窗口
+始终路由到当前 block owner。block swap 导致 global block id 变化时，由 transfer 层在提交
+新 block table 前完成跨 owner copy；不能只改 metadata。
+
+Projection routing 使用 `ProcessGroup::all_to_all_single()`。为兼容 Graph，每个 peer 使用
+固定 `padded_rows_per_peer`，真实 send/recv count 放在 device tensor；eager 和 Graph 共用
+同一 padded layout。每个 compression window 的全部 real rows按
+`(sequence_id, window_id, offset)` 排序，跨 CP cut 的最多 `compress_ratio - 1` 个边界 rows
+作为 halo 一起发送。Core 只消费完整窗口或带既有 continuation state 的合法 partial window。
+
+Sharded cache attention 不 AllGather 完整 KV。Query owner 的 local-real Query 在 CP ring/
+fixed all-to-all 中依次访问每个 cache owner：
+
+1. 每个 cache owner 对本地 cache shard计算 local score、partial output 和 FP32 LSE。
+2. C4 QLI 先在各 index shard 产生 local candidates，再对固定 `local_topk` candidates 做
+   AllGather，按 global logical index 执行 deterministic global top-k。
+3. sparse attention 只在选中 index 属于本 owner 时读取 local compressed KV。
+4. partial output 使用稳定公式合并：
+   `m=max(lse_i)`、`w_i=exp(lse_i-m)`、`O=sum(O_i*w_i)/sum(w_i)`。
+5. 合并后的 output 返回 Query owner，顺序保持 local-real-half，不恢复 global Query。
+
+空 cache owner 仍参与相同 collective，local LSE 使用 `-inf`、partial output 使用 0。所有
+LSE、`exp` 和 weighted reduction 使用 FP32。该分布式 attention 是 cache 分片的正确性
+前置项；禁止通过临时复制完整 cache 绕过。
+
+### 8.5 Compressor API
 
 `CompressorImpl` 继续拥有权重和 stateful 算子调用，不把 `wkv/wgate` 暴露给
 `DSAttentionImpl`。
 
-建议接口：
+目标接口：
 
 ```cpp
 class CompressorImpl final : public torch::nn::Module {
  public:
   torch::Tensor project(const torch::Tensor& local_hidden) const;
 
-  torch::Tensor forward_core(
-      const DSAMetadata& global_metadata,
-      const torch::Tensor& global_projection,
-      std::tuple<torch::Tensor, torch::Tensor>& states,
-      std::tuple<torch::Tensor, torch::Tensor>& block_tables,
+  torch::Tensor forward_owner_core(
+      const Dsv4CpOwnerMetadata& owner_metadata,
+      const torch::Tensor& owner_projection,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_states,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_block_tables,
       const torch::Tensor& compressed_sin,
       const torch::Tensor& compressed_cos,
-      const torch::Tensor& global_q_cu_seq_lens);
+      const torch::Tensor& owner_q_cu_seq_lens);
+
+  torch::Tensor forward_owner_decode(
+      const Dsv4CpOwnerMetadata& owner_metadata,
+      const torch::Tensor& local_hidden,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_states,
+      std::tuple<torch::Tensor, torch::Tensor>& owner_block_tables);
 
   torch::Tensor forward(/* existing fused API */);
 };
@@ -519,7 +597,10 @@ class CompressorImpl final : public torch::nn::Module {
 
 ```text
 compressor_projection(x, wkv, wgate, coff) -> packed_projection
-compressor_core(packed_projection, states, metadata) -> pre_norm_fp32
+compressor_core(packed_projection, owner_states, owner_metadata)
+    -> owner_pre_norm_fp32
+compressor_owner_decode(x, weights, owner_states, owner_metadata)
+    -> owner_compressed_kv
 ```
 
 实现直接从现有 fused Compressor 拆出：
@@ -529,15 +610,16 @@ compressor_core(packed_projection, states, metadata) -> pre_norm_fp32
 2. Core 复用 AIV `CompressorBlockVectorPerf` 的 overlap、APE、state、softmax 和 reduce
    逻辑，输出 FP32 pre-norm；
 3. `CompressorImpl::forward_core()` 组合 FP32 RMSNorm、partial RoPE 和 model-dtype cast；
-4. fused Compressor 保持原 pipeline 和 ABI，不改非 CP/decode 路径；
+4. fused Compressor 保留非 CP pipeline；CP decode 增加 owner-local fused entry，不在非 owner
+   rank 写 state/cache；
 5. Core 需要独立 host tiling，不直接依赖 fused kernel 的 AIC/AIV
    double-buffer 同步 flag。
 
 Projection 已按以下物理实现落地：A3 AIC-only kernel 复用
 `CompressorBlockCubePerf<COMP, true>`，两个 `ndNum=1` Fixpipe 串行写出 KV/score slice，
-直接生成 token-major FP32 packed tensor；不分配 per-core projection workspace，也不经过
-AIV repack。该实现保持 fused Cube 数学与 accumulator dtype，同时把 collective ABI 与 fused
-双缓冲 workspace 解耦。
+当前 reference operator 直接生成 token-major FP32 packed tensor；P2 将 Fixpipe 输出改为
+model dtype。production owner path 不分配 per-core projection workspace，也不经过 AIV
+repack，并把 routing ABI 与 fused 双缓冲 workspace 解耦。
 
 当前 `xllm-ops` 已包含融合源码，技术上可拆分，不需要逆向或在 xLLM runtime 重写公式。
 但 Core 不是简单删除 MM1：现有 fused kernel 在 cube/vector 间做双缓冲流水，因此必须把
@@ -546,11 +628,12 @@ AIV repack。该实现保持 fused Cube 数学与 accumulator dtype，同时把 
 约束：
 
 1. `project()` 无 state、副作用、collective 和 cache write。
-2. `project()` 输出固定为 contiguous FP32，禁止隐式 cast。
-3. 第一版不额外长期保存 merged `wkv_gate`，避免在保留 fused path 时复制大权重。
-4. `forward_core()` 原地更新现有 state storage。
-5. 非 CP 和 decode 继续调用当前 fused `forward()`。
-6. 若运行库缺少 core op，DSV4 CP 在启动阶段明确报错，不静默降级。
+2. `project()` 输出 contiguous model dtype；Core 只在 tile 内升 FP32，禁止 runtime 完整 cast。
+3. 不额外长期保存 merged `wkv_gate`，避免在保留 non-CP fused path 时复制大权重。
+4. `forward_owner_core()` 只更新 owner-local state storage，并返回 owner-local compressed rows。
+5. 非 CP 继续调用当前 fused `forward()`；CP decode 调用 owner-local fused entry。
+6. state storage 默认 FP32、可选 BF16，softmax/reduce/state recurrence 始终 FP32。
+7. 若运行库缺少 projection/core/owner-decode 任一 op，完整 DSV4 CP capability 启动失败。
 
 Projection shape 和 layout 契约如下：
 
@@ -558,9 +641,10 @@ Projection shape 和 layout 契约如下：
 local_hidden:             [Tp, H]                  BF16/FP16
 wkv:                      [coff * D, H]           BF16/FP16
 wgate:                    [coff * D, H]           BF16/FP16
-local_packed_projection:  [Tp, 2 * coff * D]      FP32
-local_logical_view:       [Tp, coff, 2, D]        FP32
-global_packed_projection: [T,  2 * coff * D]      FP32
+local_packed_projection:  [Tp, 2 * coff * D]      model dtype
+local_logical_view:       [Tp, coff, 2, D]        model dtype
+owner_packed_projection:  [To, 2 * coff * D]      model dtype
+owner_logical_view:       [To, coff, 2, D]        model dtype
 ```
 
 其中：
@@ -574,43 +658,43 @@ global_packed_projection: [T,  2 * coff * D]      FP32
 Compressor 的 `pre/cur` packed MM1 workspace 一致，避免在 Projection 内增加一次重排。
 
 operator 的物理输出是二维 `local_packed_projection`，四维形式只用于定义 layout 和测试
-索引。`Tp` 包含 local padding，`T` 只包含 global-real rows。`forward_core()` 只能接收
-`global_packed_projection`，不能接收 `[Tp, ...]` 或 rank-major gathered layout。
+索引。`Tp` 包含 local padding，`To` 是当前 rank 作为 owner 收到的固定 padded capacity；
+`forward_owner_core()` 通过 device real-count 和 window metadata 忽略 padding，不接收
+rank-major gathered/global projection。
 
-### 8.5 Collective bundle
+### 8.6 Collective bundle
 
-第一版选择在 `CpRowLayout`/DSV4 adapter 层实现 typed concat bundle，不扩展底层
-`ProcessGroup`。现有 `parallel_state::gather()` 已能对一个 contiguous tensor 做单次
-AllGather；增加通用 coalesced collective 会扩大公共通信接口和 graph 兼容面，在这里只有
-两个同 dtype tensor 时收益不足以覆盖该复杂度。
+在 DSV4 owner exchange 层实现 typed route bundle，不扩展底层 `ProcessGroup` 语义。
+`ProcessGroup::all_to_all_single()` 只负责固定容量 tensor 交换；owner indices、real counts
+和 route ordering 由 `Dsv4CpOwnershipPlan` 管理。
 
-C4 main/indexer projection 都是 FP32，使用同一个 typed bundle 减少 collective launch：
+C4 main/indexer projection 都是 model dtype。只有二者 owner descriptor 完全一致时才 bundle：
 
 ```text
 [main_packed_projection, index_packed_projection]
   -> concat last dim
-  -> one gather_global_rows
-  -> split global outputs
+  -> one fixed-capacity owner all-to-all
+  -> split owner-local outputs
 ```
 
 建议 helper：
 
 ```cpp
-std::vector<torch::Tensor> gather_global_rows_bundle(
-    at::TensorList local_packed_tensors) const;
+std::vector<torch::Tensor> route_owner_rows_bundle(
+    torch::TensorList local_packed_tensors,
+    const Dsv4CpRouteDescriptor& route) const;
 ```
 
 它只接受二维、row count/device/dtype 相同的 contiguous tensors，内部记录各 tensor 的
-feature width，执行一次 `torch::cat(..., -1)`、一次 `gather_global_rows()`，再按原 width
-返回 view/split。不接受 mixed dtype，不持有 ProcessGroup，也不理解 main/indexer 语义。
+feature width，执行一次 pack、一次固定容量 all-to-all，再按原 width 返回 view/split。
+不接受 mixed dtype，不拥有 ProcessGroup；owner descriptor 不同时必须拆分 collective。
 
-SWA KV 为 BF16/FP16，与 projection dtype 不同，保持独立 collective。实现仍先保留独立
-gather 作为差分基线；bundle 在逐元素一致测试通过后默认开启，并用一次 local concat copy
-换取少一次 CP collective launch。
+SWA KV 使用独立 cache owner mapping，不能与 compressor projection bundle。replicated
+gather 仅作为显式 reference；production 不允许在 bundle 失败时回退到完整 AllGather。
 
-不得使用 byte tensor 手工拼接不同 dtype，也不得在 collective 前降低 projection 精度。
+不得使用 byte tensor 手工拼接不同 dtype，也不得让 Graph replay 使用不同 owner descriptor。
 
-### 8.6 DSAttention CP adapter
+### 8.7 DSAttention CP adapter
 
 在 `DSAttentionImpl` 中新增 `forward_cp()`，从现有 `forward()` 抽取可共享 phase helper，
 避免复制整个 attention 实现：
@@ -619,10 +703,12 @@ gather 作为差分基线；bundle 在逐元素一致测试通过后默认开启
 preprocess_local_q_qr_kv
 project_main_compressor
 project_indexer_compressor
-restore_and_store_global_swa
-run_main_core_and_store
-run_indexer_core_and_store
-run_half_qli_and_sparse_attention
+route_and_store_owner_swa
+route_main_index_projection_and_halo
+run_owner_main_core_and_store
+run_owner_index_core_and_store
+run_distributed_qli_candidates
+run_sharded_sparse_attention_and_lse_merge
 project_and_scatter_half_output
 ```
 
@@ -657,12 +743,13 @@ Kernel 的 right-aligned causal 语义必须使用该 endpoint，不能把所有
 local-padded hidden
   -> local kv_proj/norm/RoPE
   -> local projected SWA KV
-  -> gather_global_rows
-  -> global-real SWA KV
-  -> existing temporary PA_ND or persistent cache store
+  -> route rows by SWA global block owner
+  -> owner-local SWA cache store
+  -> distributed SWA partial attention + FP32 LSE merge
 ```
 
-Padding projection 结果在 `gather_global_rows()` 中删除，不能写 cache。
+Padding projection 在 route pack 阶段删除，不能写 owner-local cache。Full prefill 不再构造
+每 rank 完整 temporary PA_ND cache；reference eager path 可以保留该实现用于差分。
 
 ### 9.3 Main Compressor
 
@@ -670,11 +757,10 @@ Padding projection 结果在 `gather_global_rows()` 中删除，不能写 cache�
 local-padded hidden
   -> main project()
   -> local main packed projection
-  -> gather_global_rows
-  -> global-real main packed projection
-  -> main forward_core(global metadata)
-  -> compressed KV
-  -> existing global cmp_slot scatter
+  -> route compression windows + boundary halo to owner
+  -> main forward_owner_core(owner metadata)
+  -> owner-local state update + compressed KV store
+  -> distributed compressed attention partial + FP32 LSE merge
 ```
 
 ### 9.4 C4 Indexer
@@ -683,15 +769,15 @@ local-padded hidden
 local-padded hidden
   -> indexer compressor project()
   -> local index packed projection
-  -> gather_global_rows
-  -> global-real index packed projection
-  -> indexer compressor core
+  -> route C4 windows + boundary halo to owner
+  -> owner-local indexer compressor core
   -> Hadamard + dynamic quant
-  -> global index cache store
+  -> owner-local index cache store
 
 local QR/hidden
   -> half-local query/weights
-  -> QLI reads global index cache
+  -> each owner computes local QLI candidates
+  -> candidate AllGather + deterministic global top-k
 ```
 
 Indexer cache update 与 query-side QLI 必须拆成两个方法，不能继续由一个
@@ -699,24 +785,30 @@ Indexer cache update 与 query-side QLI 必须拆成两个方法，不能继续�
 
 ## 10. Prefix Cache 和 Chunked Prefill
 
-DSV4 CP 强制完整 cache replica，因此 prefix cache 不做 CP KV split。
+DSV4 CP prefix cache 使用 sharded physical cache。Master/worker 仍共享 global block-table value
+semantics，但每个 rank 只分配满足 `global_block_id % cp_size == cp_rank` 的 local physical
+block。prefix hash 命中复用同一 global block id，因此 owner 不变。
 
 Chunked prefill 每次只恢复当前 chunk 的 projected outputs：
 
 ```text
 current local projected rows
-  -> gather/reorder/unpad
-  -> current global-real rows
-  -> existing global start_pos/block table/state continuation
+  -> owner route/reorder/unpad
+  -> current owner-local windows + boundary halo
+  -> owner-local start_pos/block table/state continuation
 ```
 
 必须保持：
 
 1. `start_pos` 使用 CP 切分前的 global metadata。
-2. Compressor core 输入不包含 CP padding。
-3. 每个 CP rank 使用自己的物理 block table 更新本地完整副本。
+2. Compressor core 输入不包含 CP padding，只包含本 owner 的 canonical window rows。
+3. 每个 global state/cache slot 只在 owner rank 更新；non-owner block-table entry 映射为
+   invalid local slot，但保留 global id 用于 attention routing。
 4. Prefix hit 不因 CP 强制回退到 4/128 边界；边界语义由现有 stateful core 负责。
-5. C4 overlap 必须由 core 的既有 state 语义延续，不新增 halo。
+5. C4 overlap 使用显式 halo descriptor 延续既有 state 语义；halo row 只参与 owner core，
+   不作为新的 cache token 重复写入。
+6. swap/out/in 和 PD transfer 按 global block id 分组到 owner；metadata 提交晚于数据 copy
+   completion event。
 
 ## 11. MoE Bridge
 
@@ -765,8 +857,9 @@ degree 2 + MC2 1 只有同时满足以下条件才报告
 1. DSV4、`ep_size > 1`、MoE TP group size 为 1；
 2. W8A8 dynamic routed expert、SwiGLU/Silu gated FFN；
 3. `DispatchFFNCombine` op、weights 和 scales 均已准备；
-4. 第一阶段 `ep_size == world_size`，确保创建 dispatch/combine comm domain；
-5. 当前 forward 为 CP eager prefill，不因 graph preparation 门禁回退。
+4. 当前支持拓扑 `ep_size == world_size`，确保创建 dispatch/combine comm domain；
+5. 当前 forward 的 eager/Graph preparation 都已准备相同 weights、active mask 和 comm
+   domain，不因 capture 状态回退。
 
 任一动态门禁失败都必须返回 `REQUIRES_ALIGNED_GLOBAL_ROWS` 并走 bridge，不能根据
 `expert_parallel_degree=2 && enable_fused_mc2=1` 静态跳过 bridge。mode 0 的
@@ -833,7 +926,9 @@ hidden。
 
 ## 13. MTP 接入
 
-CP 只参与 target/draft prefill，不参与 MTP decode/validate graph。
+CP 同时参与 target/draft prefill 和 MTP decode/validate 的 sharded cache/state path。Target
+和 draft 各自拥有 block pool、owner plan 和 Graph buffer pool；只共享 immutable token row
+layout 和跨模型 collective sequence contract。
 
 Target 和 draft 共享的是 immutable row layout 描述，不共享 raw process-group pointer。
 Layout 必须提供由 canonical host descriptor 计算的 signature：
@@ -859,25 +954,72 @@ Padding 可以经过无状态 fusion，但不能进入 compressor core、cache w
 
 ## 14. Graph 和执行阶段
 
-启动时允许同时配置 CP 与 Graph，但运行阶段严格分离：
+### 14.1 Forward phase policy
 
 | Forward 类型 | CP | ACL Graph |
 | --- | --- | --- |
-| Full prefill | 开启 | eager |
-| Chunked prefill | 开启 | eager |
-| MTP prefill | 开启 | eager |
-| Pure decode | 关闭 | 可开启 |
-| Spec-verify chunked prefill | 关闭 | eager |
+| Full prefill | sharded owner path | eager reference + Graph production |
+| Chunked prefill | sharded owner path | eager reference + bucketed Graph |
+| MTP prefill | target/draft 独立 owner path | eager reference + Graph production |
+| Pure decode | sharded owner path | Graph production |
+| Spec-verify | target/draft 独立 owner path | 固定 token bucket Graph |
 
-`NpuCpPlan::prepare()` 继续在 decode 直接返回。Graph executor 在任何 CP-active batch 上
-必须显式 fallback eager，并把传入模型的 effective `input_params.enable_graph` 设为 false，
-不能依赖模型内部偶然绕过 collective。这也保证 EP2+MC2 prefill 可以完成
-`DispatchFFNCombine` weight preparation，不会被 graph-only preparation 门禁误判为
-legacy fallback。
+`NpuCpPlan::prepare()` 在 decode 继续构建 lightweight cache-owner metadata，不能直接返回
+disabled plan。非 CP 仍使用现有 fused compressor/Graph。
 
-该 phase gate 属于第一版 P0。非目标仅指不 capture/replay CP prefill 本身，不表示可以
-关闭整个服务的 Graph，也不表示允许 CP collective 误入 capture。Decode 必须继续调用原
-fused compressor，split projection/core API 只能由 CP-active prefill 调用。
+### 14.2 Graph identity 和稳定地址
+
+CP Graph key 至少包含：
+
+```text
+model/target-or-draft identity
+forward phase
+token bucket / sequence bucket / microchunk count
+dp/cp/tp/ep topology
+cache layout version / block size / compression ratio
+projection dtype / state dtype
+owner route capacity signature
+overlap schedule version
+```
+
+`Dsv4CpBufferPool` 在 capture 前分配 projection route、owner receive、QLI candidate、attention
+partial output/LSE 和双缓冲 tensor。block table、slot mapping、real counts 和 route indices
+复制到稳定地址的 device metadata tensor；replay 只更新内容，不更换地址。capture 区域内
+禁止 allocator、动态 `cat`、host real-row branch、D2H 或不同 collective sequence。
+
+HCCL collective 必须通过 A3 capability probe 证明可 capture/replay。任一 rank 的 probe、
+bucket 或 sequence id 不一致时完整 capability 启动失败，不允许单 rank Graph、其他 rank
+eager。eager reference 使用相同 fixed-capacity layout，保证 Graph 差分不混入 layout 差异。
+
+### 14.3 跨 layer wavefront overlap
+
+仅靠 Transformer layer 循环无法合法重叠相邻层，因为 layer `L+1` 依赖 layer `L` 输出。
+当前版本把固定 prefill bucket 切成 compression-aligned microchunks，按二维 wavefront 调度：
+
+```text
+node(L, K) depends on:
+  node(L - 1, K)  # hidden dependency
+  node(L, K - 1)  # causal cache/compressor-state order
+```
+
+因此 `node(L+1,K)` 的 owner routing/core 可以与 `node(L,K+1)` 的 local projection/route
+重叠。microchunk 边界必须同时满足 C4/C128 continuation metadata，不能通过丢弃 halo 强行
+对齐。
+
+每层使用两个 buffer slot，状态机固定为：
+
+```text
+FREE -> PROJECTION_READY -> ROUTE_IN_FLIGHT -> OWNER_READY
+     -> CORE_DONE -> ATTENTION_DONE -> FREE
+```
+
+compute stream、CP communication stream 和 cache-copy stream 通过显式 event 转移状态。
+`ROUTE_IN_FLIGHT` 前禁止 producer 覆盖，`ATTENTION_DONE` 前禁止复用 owner/cache partial
+buffer。每个 collective 带单调 `collective_sequence_id=(forward,layer,microchunk,phase)`；
+所有 rank 即使 real count 为 0 也按相同顺序 enqueue。
+
+Graph capture 固化整个 wavefront schedule 和双缓冲 slot 选择。eager 与 Graph 共用同一状态
+机，调试模式记录每个 slot 的 generation/event/sequence id；发现提前复用立即 fail-fast。
 
 ## 15. 错误处理和可观测性
 
@@ -887,37 +1029,45 @@ fused compressor，split projection/core API 只能由 CP-active prefill 调用�
 
 - backend 不是 NPU Torch；
 - `world_size % (dp_size * cp_size) != 0`；
-- `kv_split_size_effective != 1`；
-- 缺少 compressor-projection 或 compressor-core operator；
+- 缺少 compressor-projection、owner-core、owner-decode、distributed QLI/attention/LSE merge
+  任一 operator；
+- cache allocator/estimator 未声明 `MODEL_MANAGED_SHARDED_CACHE` layout version；
 - MTP model 未声明 CP prefill capability；
 - CP target/draft 拓扑不一致，例如 CP 开启时同时使用
   `enable_mtp_draft_body_tp1=true`；
 - 当前 MoE path 既不支持 local dispatch/combine，也未启用正确性 bridge。
-- 最大 projection bundle、AllGather/concat 临时 tensor 和 MoE bridge 的峰值预算超过
+- owner-local persistent cache/state、Graph buffer pool、双缓冲和 MoE bridge 的峰值超过
   KV cache 分配前的可用 HBM。
+- Graph collective capability probe 或跨 rank graph identity 不一致；
+- overlap schedule 无法为最大 bucket 生成 compression-aligned microchunks。
 
-现有 KV capacity estimator 继续负责 target/draft 的 SWA、C4、C128、index 和 compressor
-state。新增预算只在其之前预留 CP transient，至少包含 local projection、AllGather 输入/
-输出和 concat、global projection、SWA gather 以及 correctness MoE bridge。CP communicator
-先执行一次 warmup AllGather，使 HCCL persistent buffer 在 free-memory 快照前完成初始化；
-当前 `ProcessGroup` 没有调用方 workspace，因此该项显式记为 0。估算结果在启动日志打印，
-不满足预算时 fail-fast。
+KV capacity estimator 按 `ceil(global_blocks/cp_size)` 计算每 rank owner-local SWA、C4、C128、
+index 和 compressor state，再加入 alignment/metadata。其之前预留 Graph 固定 buffer、双缓冲、
+owner route、QLI candidates、partial output/LSE 和 MoE bridge。CP communicator 先执行
+all-to-all、all-gather 和 LSE merge warmup，使 HCCL persistent buffer 在 free-memory 快照前
+完成初始化。逻辑容量、local physical bytes、Graph reserve 和 allocator 实测 peak 分项打印。
 
 ### 15.2 运行时检查
 
 Debug/测试构建至少检查：
 
 - local-padded row count 在 CP group 内一致；
-- gather 后 row count 等于 global-real count；
 - Plan 构建时在 host 侧检查 source/destination indices 是无重复、无遗漏的置换；
-- padding 不进入 compressor core；
+- 每个 global block/state slot 映射到唯一 owner/local slot；
+- route 后每个 compression window 的 real offset 无重复且满足 continuation 语义；
+- padding/halo duplicate 不作为新 token 进入 compressor core 或 cache write；
 - front/back destination 不重叠；
 - active fragment 覆盖每个真实 Query 且只覆盖一次；
-- global slot mapping 行数与 compressor output 行数一致；
+- owner-local slot mapping 行数与 owner compressor output 行数一致；
+- non-owner rank 对该 slot 无物理写入；
+- QLI global top-k index 唯一且指向正确 owner；
+- distributed output/LSE merge 与 replicated FP32 reference 在容差内一致；
 - target/draft layout signature 一致。
+- buffer generation、event 和 collective sequence id 在所有 rank 一致。
 
 端到端顺序诊断可通过显式开关在首次 forward 让 position sentinel 经过同一
-`shard -> gather -> reorder -> unpad` 路径，但不得进入默认路径或每次 debug forward，
+`shard -> owner route -> local store -> distributed merge` 路径，但不得进入默认路径或每次
+debug forward，
 避免增加 collective 和同步点。
 
 ### 15.3 日志和指标
@@ -969,14 +1119,21 @@ Compressor 不改 ABI。
 - A3 单算子构建通过；
 - `test_compressor_projection.py` 8 项通过（FP16/BF16、`coff=1/2`、2D/3D 输入、
   FP32 matmul golden 和 packed 顺序）；
-- 输出由 AIC Fixpipe 直接写入最终 FP32 `[T, 2*coff*D]`，没有 AIV 重排和临时
-  projection workspace。
-- Core 为 AIV-only，输入 global-real FP32 packed projection，输出连续 FP32
-  `[Tc,D]` pre-norm，并原地更新 KV/score state；
-- `test_compressor_core.py` 10 项通过，覆盖 C4/C128、FP16/BF16、chunk continuation、
-  HALF/INTERLEAVE RoPE、multi-sequence split，以及 fused-vs-split output/state 差分；
-- Projection/Core 联合回归命令共 18 项通过：`pytest -q
+- Task 0 最初以 FP32 packed projection 完成 split reference；Task 10 已将 AIC Fixpipe
+  输出升级为 model dtype `[T, 2*coff*D]`，仍无 AIV 重排和完整 FP32 GM workspace；
+- Core 为 AIV-only，输入 global-real FP16/BF16 packed projection，tile 内升 FP32，输出
+  连续 FP32 `[Tc,D]` pre-norm，并原地更新 FP32/BF16 KV/score state；
+- `test_compressor_core.py` 68 项通过，覆盖 C4/C128、projection/state dtype 矩阵、
+  3/4/5、127/128/129 continuation、HALF/INTERLEAVE RoPE、multi-sequence split，以及
+  fused-vs-split output/state 差分和 FP32/BF16 fused prefill-to-decode continuation；
+- Projection/Core 联合回归命令共 76 项通过：`pytest -q
   test_compressor_projection.py test_compressor_core.py`。
+
+BF16 fused continuation 初次验证暴露出 `ReadFromCacheState()` 使用的
+`packedProjectionInputQue` 未在 fused `InitBuffers()` 初始化，decode 读取历史 state 时触发
+AICore `507015` 非法地址访问。现已为 fused 路径初始化该专用 16 KiB queue，并使用全新
+build 目录、`CCACHE_DISABLE=1` 重建全部 50 个算子，确认不是旧 AscendC object cache
+掩盖结果。新增 C4/C128 continuation 用例 2/2 通过，联合回归 76/76 通过。
 
 同时增加 operator capability 查询。DSV4 CP 启动必须同时发现 projection/core，缺失时
 直接失败；CP=1 和 decode 不受该 capability 影响，继续走 fused op。
@@ -1173,40 +1330,118 @@ Graph 验证必须证明 CP-active prefill 的 effective graph flag 为 false，
 decode 仍能命中原 ACL Graph 和 fused compressor。该验证属于首版 P0，而 CP prefill 自身
 的 capture/replay 仍不在第一版范围内。
 
+以上是 replicated reference path 的历史验证。完整版本新增以下任务，前一任务未完成时
+不得将后一任务标记为 supported：
+
+### Task 10：16-bit Projection 与 Mixed Compressor State
+
+状态：进行中。P2.1 16-bit Projection/collective 和 P2.2 mixed-state Split Core 已完成；
+P2.4 的本地配置、allocator、capacity estimator、日志和 Graph identity 已完成，跨 rank/PD
+配置一致性门禁待补。P2.3 owner-decode/fused mixed-state 端到端验证及 P2.5 长上下文 A/B
+尚未完成。
+
+- Projection/Fixpipe 直接输出 model dtype，owner routing 不产生完整 FP32 GM tensor；
+- state storage 默认 FP32、可选 BF16，split/fused owner op 内部计算保持 FP32；
+- allocator、capacity estimator、Graph key 和日志携带 resolved dtype；
+- 完成 C4/C128、chunk/prefix、decode/MTP 的 FP32/BF16 A/B。
+
+当前验证证据：
+
+- 全量 50 个 `xllm_ops` A3 构建和安装通过，安装后的 Projection OPP ABI 为
+  `bfloat16,float16`；
+- `test_compressor_projection.py test_compressor_core.py` 76/76 通过，其中 C4/C128 的 BF16
+  fused prefill-to-decode continuation 2/2 通过；
+- `deepseek_v4_cp_execution_test` 10/10 通过，projection bundle/sequential 的 dtype 保持和
+  16-bit byte accounting 已覆盖；
+- `config_json_test` 14/14、`kv_cache_estimation_test` 9/9、`kv_cache_test` 14/14 通过；
+- `spawn_worker_protocol_test` 8/8 通过，覆盖新 dtype 参数、旧 36 参数协议默认 FP32 和
+  null 参数拒绝；
+- `python setup.py build --device npu` 通过。
+
+### Task 11：CP Cache/State Ownership 和物理分片
+
+状态：未完成。
+
+- 实现 `global_block_id -> owner/local_block` 纯函数及单测；
+- SWA/C4/C128/index/state pool 每 rank 只分配 owner-local blocks；
+- block table、prefix reuse、swap、PD transfer 和 target/draft 支持 owner migration；
+- estimator logical capacity 与 allocator physical bytes 一致；
+- 证明单卡 persistent cache/state 随 CP size 缩减，不存在隐藏完整副本。
+
+### Task 12：State-owner/Halo Core 和 Sharded Attention
+
+状态：未完成。
+
+- fixed-capacity all-to-all 路由 compression windows 和 halo；
+- main/index owner-local Core 每个 window 只执行一次；
+- distributed QLI candidate merge；
+- C1/C4/C128 sharded attention partial output + FP32 LSE merge；
+- full/chunked/prefix/decode/MTP 与 replicated reference 做 state/cache/output 差分。
+
+### Task 13：CP Prefill ACL Graph
+
+状态：未完成。
+
+- 实现完整 Graph identity、固定 device metadata 和 `Dsv4CpBufferPool`；
+- capture/replay owner routing、owner Core、QLI 和 distributed attention collective；
+- 覆盖 full/chunked/MTP prefill 与 spec-verify bucket；
+- eager/Graph 多轮交替，验证地址、owner、collective sequence 和输出一致。
+
+### Task 14：跨 Layer Wavefront Overlap
+
+状态：未完成。
+
+- compression-aligned microchunk planner；
+- 双缓冲 slot、compute/comm/cache stream 和 event state machine；
+- `(layer,microchunk)` dependency 和 collective sequence id 单测；
+- eager/Graph 使用同一 schedule；
+- allocator peak、slot generation、rank skew 和 overlap 收益 profiling。
+
+### Task 15：完整版本 8 卡门禁
+
+状态：未完成。
+
+- 后 8 卡执行 CP1 replicated reference 与 CP8 sharded owner A/B；
+- 1K/8K/32K/目标长上下文、multi-sequence、uneven、empty owner；
+- 四种 MoE 组合、MTP=3、SHM、full/chunked/prefix、Graph 和 overlap；
+- 精度、MTP 接受率、TTFT/TPOT、input throughput、HBM、collective bytes 和 soak；
+- 每完成一个 Task，在本文和 implementation 文档同步状态及证据路径。
+
 ## 17. 性能验收
 
-第一版不分片 compressor core、cache 和 state，CP 加速受以下下界约束：
+完整版本不再包含 replicated core/cache 固定下界。单个 wavefront steady-state 的成本分解为：
 
 ```text
-T_cp(P) >= T_localizable / P
-          + T_replicated_compressor_core
-          + T_replicated_cache_state_update
-          + T_collective(P)
+T_cp(P) = T_local_projection(P)
+          + T_owner_route(P, halo)
+          + T_owner_core(P)
+          + T_distributed_qli(P)
+          + T_distributed_attention_lse(P)
           + T_moe(P)
+          + T_graph_replay
+          - T_legal_overlap(P)
 ```
 
-`T_localizable` 包含能够按 local rows 执行的 projection、QLI、sparse attention 和 output
-projection。Padding、负载不均和 kernel 效率会使该部分无法达到理想的 `1/P`。设计阶段
-不填写经验加速比例，由 C1、C4、C128 分层 profiling 给出各项占比和实际上界。若 core
-和 cache update 无法独立计时，应合并记录，避免重复计费。
+Projection、owner core 和 cache bytes 理想上随 P 缩减，但 block striping、halo、owner
+skew、padding 和 kernel shape 会偏离 `1/P`。`T_legal_overlap` 只能计算 profiler 中实际时间
+重叠区间，不能把异步 enqueue 时间直接当收益。
 
 性能结论必须按 ratio 分开记录：
 
 - projection 时间；
-- ratio-specific collective 次数、逻辑 tensor bytes、CP size 和耗时；若 profiler 能提供
-  transport bytes，再作为单独字段记录；
-- compressor core 时间；
-- QLI/sparse attention 时间；
+- owner route/halo 的 send/recv splits、logical/padded/transport bytes 和耗时；
+- owner-local compressor core 时间、window 数和 owner skew；
+- distributed QLI candidate、global top-k、partial attention 和 LSE merge 分项时间；
 - 新增 CP MoE bridge 与 baseline DP/EP 通信的分项时间；
-- front/back active-half kernel launch 数、fragment shape、host enqueue gap 和 kernel duration；
+- Graph capture/replay 命中、host enqueue gap 和 replay duration；
+- wavefront slot generation、event wait、compute/comm overlap ratio 和 rank skew；
 - 每层总耗时；
 - TTFT 和 input throughput。
 
-C4 的验收重点是“分布式 projection 节省的 GEMM 时间是否覆盖 FP32 projection 通信”。使用
-§6.2 已确认的 FP32 payload 预算。若 C4 没有收益，应按以下顺序
-优化：先完成同 dtype projection bundle、减少 collective launch，再评估层内
-projection/collective overlap，最后才考虑更复杂的方案。Overlap 必须保证所有 rank 的
-collective 调用顺序完全一致，不能通过降低 score 精度绕过问题。跨层 overlap 不属于第一版。
+C4 的验收重点是 BF16 owner route、C4 halo、main/index route bundle 和 distributed QLI 的
+合计成本。不得回退到 FP32 global AllGather 获取表面正确性。若 owner skew 抵消收益，应先
+调整 global block striping/route capacity，再优化 bundle 和 wavefront，不降低 FP32
+softmax/LSE/state compute 精度。
 
 Task 7 的 correctness bridge 里程碑只做正确性门禁，不参加性能验收。§11.3 是预期性能
 路径，但最终是否上线仍以完整优化路径的实测 TTFT 为准，不把某一种 MoE 实现写成逻辑上
@@ -1215,39 +1450,48 @@ Task 7 的 correctness bridge 里程碑只做正确性门禁，不参加性能�
 上线门禁：
 
 1. 输出 token 与 CP=1 基线一致或满足既定数值容差。
-2. Compressor state/cache checksum 在 CP ranks 间逻辑一致。
+2. 汇总所有 owner shard 后的 compressor state/cache checksum 与 replicated reference 一致；
+   rank 间不再要求持有相同副本。
 3. 8K/32K prefill TTFT 相比 CP=1 有明确收益。
-4. Decode TPOT 不回退，因为 decode 不进入 CP。
+4. Decode owner update、distributed attention 和 Graph 的 TPOT 满足既定门限。
 5. MTP 接受率无显著下降。
-6. 最大支持 prefill bucket 的实测峰值 HBM 不超过启动预算；连续跨层执行时 allocator peak
-   稳定，且没有 layer/module 持有 CP transient tensor。HCCL persistent memory 在启动
-   warmup 后保持稳定。
+6. 每 rank persistent cache/state logical bytes 与 `ceil(global_blocks/P)` 估算一致，不存在
+   完整隐藏副本，并达到目标 context/concurrency。
+7. 最大 bucket 的 Graph buffer、双缓冲和 HCCL persistent memory 不超过启动预算；多轮
+   eager/Graph/overlap 交替后 allocator peak 稳定。
+8. Graph 与 eager 输出一致，所有 rank 的 collective sequence id 完整且无分叉。
 
 ## 18. Rollout 和回滚
 
-1. 先合入 CP=1 operator split，默认仍走 fused compressor。
-2. 再合入 row layout/capability/metadata，不注册 DSV4 CP capability。
-3. 按 C1、C128、C4 顺序启用 layer path。
-4. Target 正确后再启用 MTP 和 DP。
-5. 完整测试通过后注册 DSV4 CP capability。
+1. 保留已完成的 replicated reference path，仅用于差分。
+2. 完成 model-dtype projection 和 mixed state dtype，默认 state FP32。
+3. 合入 owner mapping、sharded allocator/estimator 和 transfer，但暂不注册 production
+   capability。
+4. 按 C1、C128、C4 接入 owner core、distributed QLI/attention，完成 eager 差分。
+5. 接入 CP prefill/decode/MTP Graph，完成 eager/Graph 差分。
+6. 接入 wavefront overlap，完成 peak HBM、正确性和性能门禁。
+7. Task 10-15 全部通过后，注册 `MODEL_MANAGED_SHARDED_CACHE` production capability。
 
-回滚只需取消 DSV4 CP capability 注册；非 CP 和 decode 始终保留现有 fused path，不依赖
-新 projection/core 路径。
+回滚需重启服务并重新分配 cache。非 CP 继续使用原 fused path；CP 可通过显式诊断配置回到
+`REPLICATED_REFERENCE`，但必须重新执行其完整 HBM 门禁，不能在 sharded 服务运行中动态
+切换，也不能因某个 owner op 失败而自动回退。
 
 ## 19. 主要风险
 
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
 | Split core 与 fused op 不等价 | 精度、cache 或后续 decode 错误 | Task 0 状态级对比作为 P0 门禁 |
-| FP32 projection 通信超出预算 | C4 无性能收益 | ratio 分层 profiling、同 dtype bundle、后续 overlap |
+| owner mapping 或迁移错误 | 读写错误 shard、prefix 污染 | 纯函数映射、owner-only write 断言、swap/transfer 事务测试 |
+| halo 缺失或重复 | C4/C128 continuation 精度错误 | window offset 覆盖单测、owner core 与 reference state 差分 |
+| BF16 state 累积误差 | 长上下文精度或 MTP 接受率下降 | 默认 FP32、BF16 opt-in、FP32 compute 和长上下文 A/B |
 | front/back endpoint 错误 | 静默精度下降 | 绝对位置单测和短序列 reference attention |
 | MoE reduction 行不对齐 | 结果错误或跨 rank 混行 | typed MoE capability + correctness bridge |
-| Padding 更新 state/cache | chunk continuation 错误 | core 前强制 global-real row count 检查 |
+| Padding/halo duplicate 更新 state/cache | chunk continuation 错误 | owner route real-count 和唯一写检查 |
 | Target/draft layout 不一致 | MTP token/state mismatch | immutable layout signature |
-| CP 不降低单卡 KV/state 显存 | 长序列仍可能 OOM，无法扩展 context capacity | 明确第一版只优化 prefill 延迟/吞吐，后续再设计 state/cache 分片 |
-| Projection/MoE bridge 临时峰值超预算 | Prefill OOM 或 allocator 抖动 | 启动容量门禁、严格 tensor 作用域、main/index bundle 可降级为顺序 gather |
-| CP prefill 误入 Graph | replay 旧地址/shape 或 collective 卡住 | 第一版显式 phase gate，CP-active batch 强制 eager |
-| Split API 污染 decode | TPOT、MTP 接受率或 state 更新回退 | decode phase 强制保留 fused compressor 并做路径断言 |
+| 隐藏完整 cache 副本 | HBM 不随 CP 扩展 | allocator inventory、per-role bytes 日志、容量单测 |
+| Graph replay 旧 owner/地址 | 错 cache 或 collective 卡住 | 完整 Graph key、stable buffer、device metadata generation |
+| 双缓冲提前复用 | 静默数据覆盖 | slot state machine、generation/event/sequence id 断言 |
+| distributed LSE 合并错误 | attention 精度下降 | FP32 reference、empty owner、极值 score 和多 shard 单测 |
 | 修改通用 CP 影响 ATB | 现有模型回归 | policy 分层、ATB 回归测试、兼容 wrapper |
 
 ## 20. 已决策实施前置项
@@ -1256,22 +1500,20 @@ Task 7 的 correctness bridge 里程碑只做正确性门禁，不参加性能�
    Compressor 拆出 `CompressorProjection` 和 `CompressorCore`；`ops-transformer`
    `origin/9.1.0-beta.2` arch22 源码作为上游行为依据。保留 fused op，不修改
    `ops-transformer` 9.0 分支。
-2. **Projection dtype/ABI**：projection tensor ABI 固定 FP32 packed layout；xLLM 当前
-   C++ ABI 确认为 `_GLIBCXX_USE_CXX11_ABI=1`，二者无直接关系。Task 0 仍需通过
-   fused/split 状态级差分验证数值契约。
+2. **Projection/state dtype**：projection storage/transport 使用 model dtype，目标为 BF16；
+   Core 内部计算 FP32。state storage 默认 FP32、BF16 opt-in，split/owner-decode 使用同一
+   mixed-state ABI。
 3. **MoE local capability**：仅 `expert_parallel_degree=2 + enable_fused_mc2=1` 且全部
    W8A8/TP/comm/op 动态门禁满足时，使用 CP-local `DispatchFFNCombine`；degree 1、
    MC2 0 或任一门禁失败均使用 global-row correctness bridge。
-4. **Bundle API**：不修改 `ProcessGroup`；在 `CpRowLayout`/DSV4 adapter 上将同 dtype
-   FP32 projection 沿最后一维 concat，执行一次 `gather_global_rows()` 后按宽度 split。
-   SWA 因 dtype 不同独立 gather。
-5. **首版拓扑**：正式支持 `world=8,dp=1,cp=8,tp=1,ep=8,kv-split=1`。group builder
-   保持正交设计，`cp x tp` 和 `dp x cp x tp` 作为后续扩展，不阻塞首版正确性闭环。
-6. **显存策略**：第一版复制 cache/state，但不允许无界临时分配。按最大 bucket 预估
-   local/global projection、AllGather/concat、SWA gather 和 MoE bridge tensor；这些 tensor
-   不保存到 layer/module member。若 C4 bundled projection 使峰值超过预算，允许切换为
-   main/index 顺序 gather，但不得降低 FP32 projection 精度。HCCL persistent buffer 在
-   free-memory 快照前 warmup，`ProcessGroup` 不提供额外调用方 workspace。
-7. **Graph/decode 策略**：CP prefill eager phase gate、decode fused compressor 和缺少 split
-   operator 时 fail-fast 均为首版 P0；只有 CP prefill graph capture、cache/state 分片和跨层
-   overlap 属于后续优化。
+4. **Owner routing API**：复用 `ProcessGroup::all_to_all_single()`，DSV4 exchange 层管理
+   fixed-capacity route descriptor、real counts 和 bundle；production 不调用 global projection
+   AllGather。
+5. **Cache owner**：`owner=global_block_id%cp_size`、
+   `local_block=global_block_id/cp_size`；所有 state/cache role 使用相同 striping contract，
+   swap/transfer 在 metadata commit 前迁移数据。
+6. **显存策略**：每 rank 只分配 owner-local persistent cache/state；额外预留 Graph 固定
+   buffer、双缓冲、route/halo、distributed QLI/attention 和 HCCL persistent memory。
+7. **Graph/overlap**：prefill/decode/MTP 的 CP owner path 都进入 bucketed ACL Graph；
+   compression-aligned microchunk wavefront 和双缓冲 state machine 是 production capability
+   的组成部分，不再列为后续优化。

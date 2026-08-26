@@ -29,6 +29,11 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
+struct DeepseekV4QliResult {
+  torch::Tensor indices;
+  torch::Tensor scores;
+};
+
 class DeepseekV4IndexerImpl : public torch::nn::Module {
  public:
   DeepseekV4IndexerImpl() = default;
@@ -106,6 +111,35 @@ class DeepseekV4IndexerImpl : public torch::nn::Module {
 
   torch::Tensor build_weights(const torch::Tensor& x);
 
+  torch::Tensor build_qli_metadata(
+      const torch::Tensor& prepared_query,
+      const torch::Tensor& query_seq_endpoints,
+      const torch::Tensor& key_seq_lens,
+      int64_t max_query_len,
+      int64_t max_key_len) const;
+
+  // Run QLI on already-prepared query rows and return both candidates and
+  // scores. The existing select_qli overloads intentionally keep their
+  // indices-only contract for non-CP callers.
+  DeepseekV4QliResult select_qli_candidates(
+      const torch::Tensor& prepared_query,
+      const torch::Tensor& weights,
+      torch::Tensor& index_cache,
+      torch::Tensor* quant_index_cache,
+      const torch::Tensor& query_seq_lens,
+      const torch::Tensor& key_seq_lens,
+      const torch::Tensor& block_table,
+      const torch::Tensor& qli_metadata) const;
+
+  static torch::Tensor score_quantized_qli_candidates(
+      const torch::Tensor& quantized_query,
+      const torch::Tensor& query_dequant_scale,
+      const torch::Tensor& weights,
+      const torch::Tensor& quantized_key_cache,
+      const torch::Tensor& key_dequant_scale,
+      const torch::Tensor& candidate_indices,
+      const torch::Tensor& block_table);
+
   torch::Tensor compress_kv(
       const torch::Tensor& x,
       const AttentionMetadata& attn_metadata,
@@ -161,6 +195,17 @@ class DeepseekV4IndexerImpl : public torch::nn::Module {
   int64_t index_head_dim_padded_ = 1;
 
   torch::Tensor hadamard_matrix_;
+
+  DeepseekV4QliResult select_qli_candidates_impl(
+      const torch::Tensor& prepared_query,
+      const torch::Tensor& weights,
+      torch::Tensor& index_cache,
+      torch::Tensor* quant_index_cache,
+      const torch::Tensor& query_seq_lens,
+      const torch::Tensor& key_seq_lens,
+      const torch::Tensor& block_table,
+      const std::optional<torch::Tensor>& qli_metadata,
+      bool return_value) const;
 
   ReplicatedLinear wq_b_{nullptr};
   ReplicatedLinear weights_proj_{nullptr};

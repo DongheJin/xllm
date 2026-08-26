@@ -44,12 +44,6 @@ class DeepseekV4DecoderLayerImpl : public torch::nn::Module {
 
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights() const;
-  void prepare_expert_weight(const std::vector<int32_t>& expert_ids);
-  void start_expert_weight_transfer();
-  void update_expert_weight();
-  bool last_prepare_expert_weight_ok() const {
-    return moe_mlp_->last_prepare_expert_weight_ok();
-  }
 
   torch::Tensor forward(
       torch::Tensor& x,

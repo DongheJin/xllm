@@ -27,6 +27,8 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_policy.h"
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/framework/OpCommand.h>
 #else
@@ -161,6 +163,11 @@ uint64_t static_mtp_graph_task_key(uint64_t base_key,
   // collision.
   return hash | kSpecVerifyGraphKeyMask;
 }
+// Bit 62 is reserved by the MLA graph key. Keep DSV4 graph namespaces below
+// it so state dtype and CP topology cannot collide with MLA bucketing.
+constexpr uint64_t kDsv4Bf16StateGraphKeyMask = 1ull << 61;
+constexpr uint64_t kDsv4CpGraphKeyMask = 1ull << 60;
+constexpr uint64_t kGraphKeyPayloadMask = (1ull << 60) - 1;
 
 std::pair<torch::Tensor, torch::Tensor> find_attention_plan_kv_cache(
     const std::vector<KVCache>& kv_caches) {
@@ -847,11 +854,16 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     COUNTER_INC(num_model_execution_total_eager);
     return forward_eager(model_, tokens, positions, kv_caches, params);
   }
-  // CP shards the query rows of a prefill batch and gathers them per layer, so
-  // token counts and collectives differ from the captured decode shape. Decode
-  // itself runs with CP inactive (both CP paths return early on decode), which
-  // is why graph mode and CP can coexist -- but spec-verify chunked prefill is
-  // a non-decode batch that reaches capture, so it must stay eager under CP.
+  if (in_decoding_phase && options_.cp_size() > 1 &&
+      util::is_deepseek_v4_model_type(args_.model_type())) {
+    LOG_FIRST_N(WARNING, 1)
+        << "Falling back to eager mode because DeepSeek V4 context-parallel "
+           "decode uses owner collectives that are not capture-safe yet.";
+    COUNTER_INC(num_model_execution_total_eager);
+    return forward_eager(model_, tokens, positions, kv_caches, params);
+  }
+  // Spec-verify chunked prefill also uses CP collectives whose dynamic owner
+  // metadata is not represented by the current captured graph identity.
   if (in_spec_verify_phase && options_.cp_size() > 1) {
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode for spec verify because context "
@@ -1288,6 +1300,7 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
     uint32_t bucket_num_tokens,
     const ModelInputParams& params,
     uint64_t attention_plan_class) const {
+  uint64_t graph_key = static_cast<uint64_t>(bucket_num_tokens);
   if (params.is_spec_verify &&
       params.meta.batch_forward_type.is_chunked_prefill()) {
     const uint64_t q_max_seq_len =
@@ -1319,15 +1332,38 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
       }
       return base_key;
     }
-    return static_cast<uint64_t>(bucket_num_tokens) | kSpecVerifyGraphKeyMask |
-           (q_max_seq_len << kSpecVerifyQMaxSeqLenShift);
-  }
-  if (model_->supports_mla_graph_kv_bucketing()) {
+    graph_key = static_cast<uint64_t>(bucket_num_tokens) |
+                kSpecVerifyGraphKeyMask |
+                (q_max_seq_len << kSpecVerifyQMaxSeqLenShift);
+  } else if (model_->supports_mla_graph_kv_bucketing()) {
     const int32_t capture_kv_seq_len_bucket =
         get_mla_capture_kv_seq_len_bucket(params, options_);
-    return get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket);
+    graph_key = get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket);
   }
-  return static_cast<uint64_t>(bucket_num_tokens);
+  if (util::is_deepseek_v4_model_type(args_.model_type())) {
+    const auto state_dtype = parse_dsv4_compress_state_dtype(
+        ::xllm::KVCacheConfig::get_instance().dsv4_compress_state_dtype());
+    CHECK(state_dtype.has_value());
+    if (*state_dtype == Dsv4CompressStateDtype::BF16) {
+      graph_key |= kDsv4Bf16StateGraphKeyMask;
+    }
+  }
+  if (params.parallel.cp_plan.enabled()) {
+    // A CP graph owns rank-local metadata and collective ordering. A bucket
+    // number alone is therefore insufficient to identify a replay-safe graph.
+    uint64_t cp_key = static_cast<uint64_t>(bucket_num_tokens);
+    cp_key ^= params.parallel.cp_plan.row_layout().signature();
+    cp_key *= 1099511628211ULL;
+    cp_key ^= static_cast<uint64_t>(params.parallel.cp_plan.size());
+    cp_key *= 1099511628211ULL;
+    cp_key ^= static_cast<uint64_t>(params.parallel.cp_plan.rank());
+    cp_key *= 1099511628211ULL;
+    cp_key ^=
+        static_cast<uint64_t>(params.parallel.cp_plan.projection_gather_mode());
+    cp_key ^= graph_key & kDsv4Bf16StateGraphKeyMask;
+    graph_key = (cp_key & kGraphKeyPayloadMask) | kDsv4CpGraphKeyMask;
+  }
+  return graph_key;
 }
 
 }  // namespace xllm::npu

@@ -21,12 +21,14 @@ limitations under the License.
 
 namespace xllm::spawn_worker_protocol {
 
-inline constexpr int32_t kArgumentCount = 37;
+inline constexpr int32_t kArgumentCount = 38;
 inline constexpr int32_t kMinimumArgumentCount = 34;
 inline constexpr int32_t kIndexerCacheDtypeArgumentIndex = 34;
 inline constexpr int32_t kEnableMtpDraftBodyTp1ArgumentIndex = 35;
 inline constexpr int32_t kTextEncoderTpSizeArgumentIndex = 36;
+inline constexpr int32_t kDsv4CompressStateDtypeArgumentIndex = 37;
 inline constexpr char kDefaultIndexerCacheDtype[] = "auto";
+inline constexpr char kDefaultDsv4CompressStateDtype[] = "float32";
 
 inline std::optional<std::string> parse_indexer_cache_dtype(
     int32_t argc,
@@ -43,6 +45,23 @@ inline std::optional<std::string> parse_indexer_cache_dtype(
     return std::nullopt;
   }
   return std::string(argv[kIndexerCacheDtypeArgumentIndex]);
+}
+
+inline std::optional<std::string> parse_dsv4_compress_state_dtype(
+    int32_t argc,
+    char* const argv[]) {
+  if (argc < kMinimumArgumentCount || argv == nullptr) {
+    return std::nullopt;
+  }
+
+  if (argc <= kDsv4CompressStateDtypeArgumentIndex) {
+    return std::string(kDefaultDsv4CompressStateDtype);
+  }
+
+  if (argv[kDsv4CompressStateDtypeArgumentIndex] == nullptr) {
+    return std::nullopt;
+  }
+  return std::string(argv[kDsv4CompressStateDtypeArgumentIndex]);
 }
 
 }  // namespace xllm::spawn_worker_protocol

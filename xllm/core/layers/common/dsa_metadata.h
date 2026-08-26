@@ -120,11 +120,19 @@ struct DSAMetadata {
   // Same-group caches share the same underlying tensor (no copy).
   std::vector<std::vector<torch::Tensor>> block_tables;
   std::vector<std::vector<torch::Tensor>> slot_mappings;
+  // CPU copies retained for owner planning after block_tables are rebound to
+  // packed device storage. These tensors are never consumed by device kernels.
+  std::vector<std::vector<torch::Tensor>> host_block_tables;
 
   // Host-side max lengths cached alongside the tensors so graph code can
   // avoid scalar reads from device tensors.
   int64_t max_query_len = 0;
   int64_t max_seq_len = 0;
+  // Canonical per-sequence lengths retained for model-owned CP planning.
+  // Unlike device tensors, these remain request-shaped under eager execution
+  // and never require a device-to-host synchronization.
+  std::vector<int32_t> host_q_seq_lens;
+  std::vector<int32_t> host_kv_seq_lens;
 
   // Sequence length metadata
   // actual_seq_lengths_kv: (batch_size,) — per-seq kv context length

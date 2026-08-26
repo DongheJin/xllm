@@ -31,6 +31,7 @@ struct KVCacheEstimateOptions {
   torch::ScalarType dtype = torch::kBFloat16;
   std::string kv_cache_dtype = "auto";
   std::string indexer_cache_dtype = "auto";
+  torch::ScalarType dsv4_compress_state_dtype = torch::kFloat32;
   int64_t cache_size_in_bytes = 0;
   int64_t block_size = 0;
   int64_t world_size = 1;
@@ -41,6 +42,9 @@ struct KVCacheEstimateOptions {
   int64_t num_speculative_tokens = 0;
   int64_t max_tokens_per_batch = 0;
   int64_t max_linear_state_cache_slots = 0;
+  // DSV4 grouped pools remain globally addressed, while physical allocation
+  // and capacity accounting use the worst owner-local shard when > 1.
+  int32_t dsv4_cp_size = 1;
   bool is_draft_engine = false;
   bool enable_prefix_cache = false;
   const ModelArgs* draft_model_args = nullptr;
@@ -51,6 +55,10 @@ struct Dsv4KVCacheEstimateCost {
   int64_t swa_count = 0;
   int64_t n_c4_layers = 0;
   int64_t n_c128_layers = 0;
+  int32_t cp_size = 1;
+  int64_t swa_bytes_per_local_block = 0;
+  int64_t c4_bytes_per_local_block = 0;
+  int64_t c128_bytes_per_local_block = 0;
   int64_t constant_swa_bytes = 0;
   int64_t token_unit_bytes = 0;
   int64_t manager_blocks_per_unit = 1;
@@ -59,6 +67,18 @@ struct Dsv4KVCacheEstimateCost {
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers);
+
+Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
+    const ModelArgs& model_args,
+    const KVCacheEstimateOptions& options);
+
+// Returns exact physical bytes for one DSV4 CP rank. Counts are global logical
+// pool counts; the helper applies the same round-robin owner mapping as the
+// allocator before summing per-role bytes.
+int64_t dsv4_kv_cache_physical_bytes(const Dsv4KVCacheEstimateCost& cost,
+                                     int64_t global_c4_count,
+                                     int64_t global_c128_count,
+                                     int32_t cp_rank);
 
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,

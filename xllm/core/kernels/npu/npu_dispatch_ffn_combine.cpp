@@ -14,12 +14,66 @@ limitations under the License.
 ==============================================================================*/
 
 #include <optional>
+#include <atomic>
+#include <cstdlib>
 #include <string>
 #include <tuple>
+
+#include <glog/logging.h>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 
 namespace xllm::kernel::npu {
+
+namespace {
+
+bool dispatch_ffn_combine_probe_enabled() {
+  const char* value = std::getenv("XLLM_DSV4_MC2_PROBE");
+  return value != nullptr && std::string(value) == "1";
+}
+
+void log_dispatch_ffn_combine_probe(const torch::Tensor& x,
+                                    const torch::TensorList weight1,
+                                    const torch::TensorList weight2,
+                                    const torch::Tensor& expert_ids,
+                                    const torch::TensorList scale1,
+                                    const torch::TensorList scale2,
+                                    const torch::Tensor& probs,
+                                    const std::string& group,
+                                    int64_t max_output_size) {
+  static std::atomic<int> count{0};
+  const int probe_index = count.fetch_add(1, std::memory_order_relaxed);
+  if (!dispatch_ffn_combine_probe_enabled() || probe_index >= 4) {
+    return;
+  }
+  auto shape_string = [](const torch::Tensor& tensor) {
+    std::string result = "[";
+    for (int64_t i = 0; i < tensor.dim(); ++i) {
+      if (i != 0) {
+        result += ",";
+      }
+      result += std::to_string(tensor.size(i));
+    }
+    return result + "]";
+  };
+  LOG(INFO) << "[DEBUG-DSV4-MC2] call=" << probe_index
+            << " x=" << shape_string(x)
+            << " x_dtype=" << c10::toString(x.scalar_type())
+            << " expert_ids=" << shape_string(expert_ids)
+            << " probs=" << shape_string(probs)
+            << " weight1_count=" << weight1.size()
+            << " weight1="
+            << (weight1.empty() ? "[]" : shape_string(weight1[0]))
+            << " weight2="
+            << (weight2.empty() ? "[]" : shape_string(weight2[0]))
+            << " scale1="
+            << (scale1.empty() ? "[]" : shape_string(scale1[0]))
+            << " scale2="
+            << (scale2.empty() ? "[]" : shape_string(scale2[0]))
+            << " max_output_size=" << max_output_size << " group=" << group;
+}
+
+}  // namespace
 
 bool has_dispatch_ffn_combine() {
   static const bool is_available =
@@ -102,6 +156,16 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_dispatch_ffn_combine(
               "DispatchFFNCombine requires non-empty HCCL group name.");
   TORCH_CHECK(max_output_size > 0,
               "DispatchFFNCombine requires max_output_size > 0.");
+
+  log_dispatch_ffn_combine_probe(x,
+                                 weight1,
+                                 weight2,
+                                 expert_ids,
+                                 scale1,
+                                 scale2,
+                                 probs,
+                                 group,
+                                 max_output_size);
 
   auto out = output.has_value() && output->defined() ? output.value()
                                                      : at::empty_like(x);

@@ -88,5 +88,39 @@ TEST(SpawnWorkerProtocolTest, PreservesExplicitEmptyDtype) {
   EXPECT_TRUE(indexer_cache_dtype->empty());
 }
 
+TEST(SpawnWorkerProtocolTest, UsesExplicitDsv4StateDtype) {
+  std::vector<std::string> arguments(kArgumentCount, "unused");
+  arguments[kDsv4CompressStateDtypeArgumentIndex] = "bfloat16";
+  std::vector<char*> argv = mutable_argv(&arguments);
+
+  const std::optional<std::string> state_dtype =
+      parse_dsv4_compress_state_dtype(kArgumentCount, argv.data());
+
+  ASSERT_TRUE(state_dtype.has_value());
+  EXPECT_EQ(state_dtype.value(), "bfloat16");
+}
+
+TEST(SpawnWorkerProtocolTest, DefaultsDsv4StateDtypeForPreviousProtocol) {
+  std::vector<std::string> arguments(kDsv4CompressStateDtypeArgumentIndex,
+                                     "unused");
+  std::vector<char*> argv = mutable_argv(&arguments);
+
+  const std::optional<std::string> state_dtype =
+      parse_dsv4_compress_state_dtype(kDsv4CompressStateDtypeArgumentIndex,
+                                      argv.data());
+
+  ASSERT_TRUE(state_dtype.has_value());
+  EXPECT_EQ(state_dtype.value(), kDefaultDsv4CompressStateDtype);
+}
+
+TEST(SpawnWorkerProtocolTest, RejectsNullDsv4StateDtype) {
+  std::vector<std::string> arguments(kArgumentCount, "unused");
+  std::vector<char*> argv = mutable_argv(&arguments);
+  argv[kDsv4CompressStateDtypeArgumentIndex] = nullptr;
+
+  EXPECT_FALSE(
+      parse_dsv4_compress_state_dtype(kArgumentCount, argv.data()).has_value());
+}
+
 }  // namespace
 }  // namespace xllm::spawn_worker_protocol

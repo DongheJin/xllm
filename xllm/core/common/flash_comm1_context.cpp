@@ -34,15 +34,63 @@ int32_t round_up_to_multiple(int32_t value, int32_t multiple) {
   return remainder == 0 ? value : value + multiple - remainder;
 }
 
+int32_t flash_comm1_tp_world_size(const ParallelArgs& parallel_args) {
+  if (parallel_args.tp_group_ != nullptr) {
+    return parallel_args.tp_group_->world_size();
+  }
+  const int32_t dp_size = std::max(parallel_args.dp_size(), 1);
+  const int32_t cp_size = std::max(parallel_args.cp_size(), 1);
+  const int32_t world_size = std::max(parallel_args.world_size(), 1);
+  return std::max(world_size / (dp_size * cp_size), 1);
+}
+
 }  // namespace
+
+FlashComm1TokenGeometry flash_comm1_token_geometry_without_cp(
+    int32_t num_tokens) {
+  return FlashComm1TokenGeometry{
+      .global_num_tokens = num_tokens,
+      .local_num_tokens = num_tokens,
+  };
+}
+
+bool is_flash_comm1_eligible(const FlashComm1TokenGeometry& geometry,
+                             bool is_prefill,
+                             const ParallelArgs& parallel_args,
+                             const FlashComm1Options& options) {
+  if (!options.enable_flashcomm1 || !is_prefill ||
+      geometry.global_num_tokens < options.min_prefill_tokens) {
+    return false;
+  }
+
+  if (parallel_args.cp_size() <= 1) {
+    return geometry.local_num_tokens > 0;
+  }
+
+  if (geometry.cp_has_empty_rank || geometry.local_num_tokens <= 0) {
+    return false;
+  }
+
+  // NpuCpPlan gives every CP rank the same local-padded row count. Requiring
+  // one aligned FlashComm1 shard per TP rank avoids an all-padding or degenerate
+  // reduce-scatter while preserving one uniform decision across CP ranks.
+  const int32_t minimum_local_rows =
+      flash_comm1_tp_world_size(parallel_args) * kFc1LocalTokenAlignment;
+  return geometry.local_num_tokens >= minimum_local_rows;
+}
 
 bool is_flash_comm1_eligible(int32_t num_tokens,
                              bool is_prefill,
                              const ParallelArgs& parallel_args,
                              const FlashComm1Options& options) {
-  return options.enable_flashcomm1 && is_prefill &&
-         parallel_args.cp_size() == 1 &&
-         num_tokens >= options.min_prefill_tokens;
+  if (parallel_args.cp_size() != 1) {
+    return false;
+  }
+  return is_flash_comm1_eligible(
+      flash_comm1_token_geometry_without_cp(num_tokens),
+      is_prefill,
+      parallel_args,
+      options);
 }
 
 FlashComm1ContextScope::FlashComm1ContextScope(const FlashComm1Context* ctx)
@@ -77,18 +125,18 @@ torch::Tensor pad_rows_by_copy(const torch::Tensor& input,
   return output;
 }
 
-FlashComm1Context build_flash_comm1_context(int32_t num_tokens,
-                                            bool is_prefill,
-                                            const ParallelArgs& parallel_args,
-                                            const FlashComm1Options& options) {
+FlashComm1Context build_flash_comm1_context(
+    const FlashComm1TokenGeometry& geometry,
+    bool is_prefill,
+    const ParallelArgs& parallel_args,
+    const FlashComm1Options& options) {
   FlashComm1Context ctx;
 
 #if !defined(USE_NPU)
   return ctx;
 #endif
 
-  if (!is_flash_comm1_eligible(
-          num_tokens, is_prefill, parallel_args, options)) {
+  if (!is_flash_comm1_eligible(geometry, is_prefill, parallel_args, options)) {
     return ctx;
   }
 
@@ -100,17 +148,33 @@ FlashComm1Context build_flash_comm1_context(int32_t num_tokens,
   ctx.enabled = true;
   ctx.tp_rank = tp_group->rank();
   ctx.tp_world_size = tp_group->world_size();
-  ctx.original_num_tokens = num_tokens;
-  ctx.enable_mmrs_fusion = options.enable_mmrs_fusion;
+  ctx.original_num_tokens = geometry.local_num_tokens;
+  ctx.enable_mmrs_fusion =
+      options.enable_mmrs_fusion && parallel_args.cp_size() <= 1;
   ctx.mmrs_comm_mode = options.mmrs_comm_mode;
   ctx.tp_group = tp_group;
 
   const int32_t token_alignment = ctx.tp_world_size * kFc1LocalTokenAlignment;
-  ctx.padded_num_tokens = round_up_to_multiple(num_tokens, token_alignment);
-  ctx.pad_size = ctx.padded_num_tokens - num_tokens;
+  ctx.padded_num_tokens =
+      round_up_to_multiple(ctx.original_num_tokens, token_alignment);
+  ctx.pad_size = ctx.padded_num_tokens - ctx.original_num_tokens;
   ctx.padded_local_num_tokens = ctx.padded_num_tokens / ctx.tp_world_size;
 
   return ctx;
+}
+
+FlashComm1Context build_flash_comm1_context(int32_t num_tokens,
+                                            bool is_prefill,
+                                            const ParallelArgs& parallel_args,
+                                            const FlashComm1Options& options) {
+  if (parallel_args.cp_size() != 1) {
+    return FlashComm1Context{};
+  }
+  return build_flash_comm1_context(
+      flash_comm1_token_geometry_without_cp(num_tokens),
+      is_prefill,
+      parallel_args,
+      options);
 }
 
 torch::Tensor shard_sequence(const torch::Tensor& input,

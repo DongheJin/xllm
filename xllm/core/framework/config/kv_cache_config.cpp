@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_policy.h"
 
 DEFINE_int32(block_size,
              128,
@@ -47,6 +48,11 @@ DEFINE_string(indexer_cache_dtype,
               "Indexer cache dtype aligns with model dtype (no "
               "quantization). \"int8\": Enables INT8 quantization when "
               "supported. Only supported on MLU backend.");
+
+DEFINE_string(dsv4_compress_state_dtype,
+              "float32",
+              "DeepSeek V4 compressor state storage dtype. Supported values: "
+              "float32/fp32 (default) or bfloat16/bf16.");
 
 DEFINE_bool(enable_prefix_cache,
             true,
@@ -83,6 +89,7 @@ void KVCacheConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_memory_utilization);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(indexer_cache_dtype);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dsv4_compress_state_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_in_batch_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_linear_state_cache_slots);
@@ -97,6 +104,7 @@ void KVCacheConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_memory_utilization);
   XLLM_CONFIG_ASSIGN_FROM_JSON(kv_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(indexer_cache_dtype);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dsv4_compress_state_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_in_batch_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_linear_state_cache_slots);
@@ -118,6 +126,8 @@ void KVCacheConfig::append_config_json(
       config_json, default_config, kv_cache_dtype);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, indexer_cache_dtype);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dsv4_compress_state_dtype);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_prefix_cache);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -150,6 +160,11 @@ void KVCacheConfig::validate() const {
     LOG(FATAL) << "Invalid indexer_cache_dtype=\"" << indexer_cache_dtype_
                << "\". Supported values are exactly \"auto\" and \"int8\".";
   }
+  CHECK(parse_dsv4_compress_state_dtype(dsv4_compress_state_dtype_).has_value())
+      << "Invalid dsv4_compress_state_dtype=\""
+      << dsv4_compress_state_dtype_
+      << "\". Supported values are exactly \"float32\", \"fp32\", "
+         "\"bfloat16\", and \"bf16\".";
 }
 
 }  // namespace xllm

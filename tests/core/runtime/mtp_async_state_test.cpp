@@ -43,6 +43,22 @@ TEST(MtpAsyncStateTest, ClassifiesClosedTargetSpecVerifyPolicy) {
   }
 }
 
+TEST(MtpAsyncStateTest, IsolatesOnlyDsv4CpScheduleOverlapMetadata) {
+  EXPECT_TRUE(requires_isolated_metadata_stream(
+      "deepseek_v4", /*enable_schedule_overlap=*/true, /*cp_size=*/8));
+  EXPECT_TRUE(requires_isolated_metadata_stream(
+      "deepseek_v4_mtp", /*enable_schedule_overlap=*/true, /*cp_size=*/2));
+
+  EXPECT_FALSE(requires_isolated_metadata_stream(
+      "deepseek_v4", /*enable_schedule_overlap=*/false, /*cp_size=*/8));
+  EXPECT_FALSE(requires_isolated_metadata_stream(
+      "deepseek_v4", /*enable_schedule_overlap=*/true, /*cp_size=*/1));
+  EXPECT_FALSE(requires_isolated_metadata_stream(
+      "qwen3_5", /*enable_schedule_overlap=*/true, /*cp_size=*/8));
+  EXPECT_FALSE(requires_isolated_metadata_stream(
+      "glm_moe_dsa", /*enable_schedule_overlap=*/true, /*cp_size=*/8));
+}
+
 TEST(MtpAsyncStateTest, ClassifiesSupportedCombinedDraftExecutionPaths) {
   EXPECT_EQ(classify_combined_draft_execution_path("qwen3_5_mtp"),
             CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);

@@ -52,6 +52,13 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
   return TargetSpecVerifyMode::GENERIC;
 }
 
+bool requires_isolated_metadata_stream(std::string_view model_type,
+                                       bool enable_schedule_overlap,
+                                       int32_t cp_size) {
+  return enable_schedule_overlap && cp_size > 1 &&
+         (model_type == "deepseek_v4" || model_type == "deepseek_v4_mtp");
+}
+
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
                                                 int64_t block_size) {
   CHECK_GT(max_position_embeddings, 0);

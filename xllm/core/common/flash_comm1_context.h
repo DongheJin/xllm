@@ -50,6 +50,17 @@ struct FlashComm1Options {
   std::string mmrs_comm_mode = "aiv";
 };
 
+// Token geometry for composing an outer model-side CP shard with the inner
+// FlashComm1 TP sequence shard.
+struct FlashComm1TokenGeometry {
+  int32_t global_num_tokens = 0;
+  int32_t local_num_tokens = 0;
+  bool cp_has_empty_rank = false;
+};
+
+FlashComm1TokenGeometry flash_comm1_token_geometry_without_cp(
+    int32_t num_tokens);
+
 class FlashComm1ContextScope {
  public:
   explicit FlashComm1ContextScope(const FlashComm1Context* ctx);
@@ -69,14 +80,26 @@ bool is_sequence_sharded(const FlashComm1Context& ctx);
 torch::Tensor pad_rows_by_copy(const torch::Tensor& input, int64_t padded_rows);
 
 // Topology/config gate for FC1, independent of the process group and platform.
-// FC1 shards the sequence over the TP group, so it only needs a consistent
-// token count within that group: DP is fine (each DP rank owns a whole batch),
-// CP composition is not enabled because FC1 currently shards only over the TP
-// group and has not been validated together with model-side CP partitioning.
+// FC1 shards the sequence over the TP group. CP-aware callers must apply the CP
+// shard first and provide both the pre-CP threshold count and post-CP local row
+// count. This keeps CP as the outer token shard and FlashComm1 as the inner one.
+bool is_flash_comm1_eligible(const FlashComm1TokenGeometry& geometry,
+                             bool is_prefill,
+                             const ParallelArgs& parallel_args,
+                             const FlashComm1Options& options);
+
+// Legacy interface for callers that do not provide CP-local geometry. It keeps
+// rejecting cp_size > 1 to prevent accidental double sharding.
 bool is_flash_comm1_eligible(int32_t num_tokens,
                              bool is_prefill,
                              const ParallelArgs& parallel_args,
                              const FlashComm1Options& options);
+
+FlashComm1Context build_flash_comm1_context(
+    const FlashComm1TokenGeometry& geometry,
+    bool is_prefill,
+    const ParallelArgs& parallel_args,
+    const FlashComm1Options& options);
 
 FlashComm1Context build_flash_comm1_context(int32_t num_tokens,
                                             bool is_prefill,

@@ -34,6 +34,13 @@ enum class TargetSpecVerifyMode {
 TargetSpecVerifyMode classify_target_spec_verify_mode(
     std::string_view model_type);
 
+// DSV4 CP schedule overlap needs an MTP-local metadata stream. Otherwise the
+// scheduler's next-step prepare fence can form a dependency cycle with the
+// current draft/validate metadata submitted by the composite worker.
+bool requires_isolated_metadata_stream(std::string_view model_type,
+                                       bool enable_schedule_overlap,
+                                       int32_t cp_size);
+
 // Shared allocation/launch width for target verification block tables. The
 // extra entry covers the speculative token that can cross a block boundary.
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,

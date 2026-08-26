@@ -45,6 +45,7 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/hierarchy_block_manager_pool.h"
+#include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_estimation.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -54,6 +55,7 @@ limitations under the License.
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
 #include "framework/xtensor/xtensor_allocator.h"
+#include "overlap_result_collection.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/params_utils.h"
 #include "runtime/worker.h"
@@ -465,6 +467,11 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   estimate_options.kv_cache_dtype = options_.kv_cache_dtype();
   estimate_options.indexer_cache_dtype =
       ::xllm::KVCacheConfig::get_instance().indexer_cache_dtype();
+  const auto state_dtype = parse_dsv4_compress_state_dtype(
+      ::xllm::KVCacheConfig::get_instance().dsv4_compress_state_dtype());
+  CHECK(state_dtype.has_value());
+  estimate_options.dsv4_compress_state_dtype =
+      dsv4_compress_state_torch_dtype(*state_dtype);
   estimate_options.cache_size_in_bytes = cache_size_in_bytes;
   estimate_options.block_size = options_.block_size();
   estimate_options.world_size = dp_local_tp_size_;
@@ -1175,15 +1182,12 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   // cause the output on other workers is the same as that on driver.
   // Under data parallelism (DP), we need to get dp_size outputs.
   // The `stride` means the workers num we can skip.
-  uint32_t stride = dp_local_tp_size_;
+  uint32_t stride = overlap_result_collection_stride(
+      dp_local_size_, ::xllm::EPLBConfig::get_instance().enable_eplb());
   // If EPLB is enabled, we need to get results from all workers,
   // because the experts on each worker are different,
   // and the tokens load of all experts needs to be returned to engine.
   // so we can not skip any worker.
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    stride = 1;
-  }
-
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += stride) {
     futures.emplace_back(
@@ -1197,8 +1201,10 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   }
 
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
-       worker_rank += dp_local_tp_size_) {
-    auto result = last_step_results[worker_rank / stride].value();
+       worker_rank += dp_local_size_) {
+    auto result = last_step_results[overlap_driver_result_index(
+                                        worker_rank, stride)]
+                      .value();
     if (result.has_value()) {
       raw_forward_outputs.emplace_back(std::move(result.value()));
     } else {

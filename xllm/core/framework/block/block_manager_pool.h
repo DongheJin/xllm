@@ -106,6 +106,7 @@ class BlockManagerPool : public KVCacheManager {
   std::vector<size_t> num_blocks_in_prefix_cache() const override;
   std::vector<size_t> num_free_blocks() const override;
   std::vector<size_t> num_used_blocks() const override;
+  std::vector<size_t> fresh_sequence_capacities(size_t num_tokens) const;
   double kv_cache_utilization() const override;
 
   // get the options for the block manager

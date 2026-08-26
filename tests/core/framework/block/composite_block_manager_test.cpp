@@ -562,6 +562,17 @@ TEST(CompositeBlockManagerTest, CapacityStatsUseFinestAdmissionLeaf) {
   manager.deallocate_for_sequence(&seq);
 }
 
+TEST(CompositeBlockManagerTest,
+     FreshSequenceCapacityUsesMostConstrainedLeaf) {
+  // C128 receives 1024 / 128 = 8 blocks. Block 0 is padding, so only seven
+  // fresh decode sequences can each acquire their required C128 block.
+  BlockManager::Options opts =
+      MakeCompositeOptions(1024, kBaseBlockSize, 4096, 8);
+  CompositeBlockManager manager(build_composite_leaves(opts));
+
+  EXPECT_EQ(manager.fresh_sequence_capacity(/*num_tokens=*/20), 7u);
+}
+
 // DSV4 prefix cache: a fresh sequence with the same prompt as a previously
 // released sequence should mount shared blocks from all three prefix-cache
 // leaves (SWA / C4 / C128). The composite takes the cross-leaf min hit length

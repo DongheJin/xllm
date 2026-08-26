@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_estimation.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -260,6 +261,11 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
   estimate_options.kv_cache_dtype = options_.kv_cache_dtype();
   estimate_options.indexer_cache_dtype =
       ::xllm::KVCacheConfig::get_instance().indexer_cache_dtype();
+  const auto state_dtype = parse_dsv4_compress_state_dtype(
+      ::xllm::KVCacheConfig::get_instance().dsv4_compress_state_dtype());
+  CHECK(state_dtype.has_value());
+  estimate_options.dsv4_compress_state_dtype =
+      dsv4_compress_state_torch_dtype(*state_dtype);
   estimate_options.cache_size_in_bytes = cache_size_in_bytes;
   estimate_options.block_size = options_.block_size();
   estimate_options.world_size = dp_local_tp_size_;

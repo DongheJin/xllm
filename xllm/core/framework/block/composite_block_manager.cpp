@@ -426,6 +426,30 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   return true;
 }
 
+size_t CompositeBlockManager::fresh_sequence_capacity(
+    size_t num_tokens) const {
+  if (num_tokens == 0 || leaves_.empty()) {
+    return 0;
+  }
+
+  size_t capacity = std::numeric_limits<size_t>::max();
+  for (const auto& [type, entry] : leaves_) {
+    size_t blocks_per_sequence = 1;
+    if (type != BlockType::EMBEDDING && type != BlockType::LINEAR) {
+      const size_t leaf_block_size = entry.leaf->block_size();
+      if (leaf_block_size == 0) {
+        continue;
+      }
+      blocks_per_sequence =
+          (num_tokens + leaf_block_size - 1) / leaf_block_size;
+    }
+    capacity = std::min(
+        capacity, entry.leaf->num_free_blocks() / blocks_per_sequence);
+  }
+
+  return capacity == std::numeric_limits<size_t>::max() ? 0 : capacity;
+}
+
 void CompositeBlockManager::release_out_of_window_for_sequence(Sequence* seq) {
   for (auto& [type, entry] : leaves_) {
     entry.leaf->release_out_of_window(seq);

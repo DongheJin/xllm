@@ -31,6 +31,7 @@ cc_library(
     worker_service.h
     comm_channel.h
     shm_channel.h
+    overlap_result_collection.h
   SRCS
     master.cpp
     dit_engine.cpp

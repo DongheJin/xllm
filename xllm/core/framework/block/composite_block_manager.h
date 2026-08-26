@@ -75,6 +75,7 @@ class CompositeBlockManager : public BlockManager {
   // each leaf's own primitives and writes results back into KVCacheState
   // under the leaf's block_type().
   bool allocate_sequence(Sequence* seq, size_t num_tokens);
+  size_t fresh_sequence_capacity(size_t num_tokens) const;
   void release_out_of_window_for_sequence(Sequence* seq);
   void deallocate_for_sequence(Sequence* seq);
   void allocate_shared_for_sequence(Sequence* seq);

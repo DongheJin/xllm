@@ -47,6 +47,7 @@ class KVCacheConfig final {
          "max_memory_utilization",
          "kv_cache_dtype",
          "indexer_cache_dtype",
+         "dsv4_compress_state_dtype",
          "enable_prefix_cache",
          "enable_in_batch_prefix_cache",
          "max_linear_state_cache_slots",
@@ -65,6 +66,8 @@ class KVCacheConfig final {
   PROPERTY(std::string, kv_cache_dtype) = "auto";
 
   PROPERTY(std::string, indexer_cache_dtype) = "auto";
+
+  PROPERTY(std::string, dsv4_compress_state_dtype) = "float32";
 
   PROPERTY(bool, enable_prefix_cache) = true;
 

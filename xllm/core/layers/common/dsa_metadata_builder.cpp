@@ -163,6 +163,9 @@ void DSAMetadataBuilder::build_dsa_fields(
   } else {
     q_lens_vec.assign(batch_size, 1);
   }
+  dsa.host_q_seq_lens = q_lens_vec;
+  dsa.host_kv_seq_lens.assign(params.attention.host.kv_seq_lens.begin(),
+                              params.attention.host.kv_seq_lens.end());
 
   // Keep base RoPE tables in metadata. Per-forward cos/sin slices are
   // calculated in DeepseekV4ModelImpl::forward to align with MindIE timing.
@@ -262,15 +265,18 @@ void DSAMetadataBuilder::build_dsa_fields(
     // Step 3: expand by layer using group_id
     dsa.block_tables.resize(n_layers);
     dsa.slot_mappings.resize(n_layers);
+    dsa.host_block_tables.resize(n_layers);
     for (int32_t lid = 0; lid < n_layers; ++lid) {
       const auto& lci = caches_info[lid];
       dsa.block_tables[lid].resize(lci.size());
       dsa.slot_mappings[lid].resize(lci.size());
+      dsa.host_block_tables[lid].resize(lci.size());
       for (size_t ci = 0; ci < lci.size(); ++ci) {
         int32_t gid = lci[ci].group_id;
         if (gid < manager_num) {
           dsa.block_tables[lid][ci] = proc_bt[gid];
           dsa.slot_mappings[lid][ci] = proc_slots[gid];
+          dsa.host_block_tables[lid][ci] = proc_bt[gid];
         }
       }
     }

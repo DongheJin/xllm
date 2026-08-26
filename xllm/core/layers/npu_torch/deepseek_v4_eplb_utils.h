@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -81,6 +82,125 @@ inline int64_t dispatch_ffn_max_output_size(int64_t local_tokens,
     return 0;
   }
   return routed_tokens * ep_world_size;
+}
+
+inline bool is_w8a8_dynamic_quantize_type(std::string_view quantize_type) {
+  constexpr std::string_view kW8A8Dynamic = "w8a8_dynamic";
+  return quantize_type.size() == kW8A8Dynamic.size() &&
+         std::equal(quantize_type.begin(),
+                    quantize_type.end(),
+                    kW8A8Dynamic.begin(),
+                    [](unsigned char lhs, unsigned char rhs) {
+                      return std::tolower(lhs) == rhs;
+                    });
+}
+
+inline int64_t dispatch_ffn_workspace_reservation_bytes(
+    int64_t local_tokens,
+    int64_t topk,
+    int64_t ep_world_size,
+    int64_t hidden_size,
+    int64_t local_experts) {
+  const int64_t max_output_size =
+      dispatch_ffn_max_output_size(local_tokens, topk, ep_world_size);
+  if (max_output_size <= 0 || hidden_size <= 0 || local_experts <= 0) {
+    return 0;
+  }
+
+  constexpr int64_t kInt32Bytes = 4;
+  constexpr int64_t kFp32Bytes = 4;
+  constexpr int64_t kBf16Bytes = 2;
+  constexpr int64_t kInt8Bytes = 1;
+  constexpr int64_t kInputRowAlignment = 256;
+  constexpr int64_t kSoftFlagStride = 16;
+  constexpr int64_t kRoutingAivCount = 40;
+  constexpr int64_t kWorkspaceAlignment = 2 * 1024 * 1024;
+  constexpr int64_t kRoutingSystemWorkspaceBytes = 16 * 1024 * 1024;
+  constexpr int64_t kRoutingSortBytesPerToken = 6 * kFp32Bytes;
+  constexpr int64_t kRoutingScatterBytesPerToken = 2 * kInt32Bytes;
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+
+  const auto checked_multiply = [](int64_t lhs, int64_t rhs) -> int64_t {
+    if (lhs < 0 || rhs < 0 || (rhs != 0 && lhs > kMax / rhs)) {
+      return 0;
+    }
+    return lhs * rhs;
+  };
+  const auto checked_add = [](int64_t lhs, int64_t rhs) -> int64_t {
+    if (lhs < 0 || rhs < 0 || lhs > kMax - rhs) {
+      return 0;
+    }
+    return lhs + rhs;
+  };
+  const auto checked_align_up = [&](int64_t value,
+                                    int64_t alignment) -> int64_t {
+    if (value < 0 || alignment <= 0) {
+      return 0;
+    }
+    const int64_t remainder = value % alignment;
+    if (remainder == 0) {
+      return value;
+    }
+    return checked_add(value, alignment - remainder);
+  };
+
+  const int64_t aligned_local_tokens =
+      checked_align_up(local_tokens, kInputRowAlignment);
+  const int64_t routed_input_tokens = checked_multiply(local_tokens, topk);
+  const int64_t aligned_routing_index_count =
+      checked_multiply(aligned_local_tokens, topk);
+  const int64_t ep_square =
+      checked_multiply(ep_world_size, ep_world_size);
+  const int64_t expert_bookkeeping_count =
+      checked_multiply(ep_square, local_experts);
+  if (aligned_local_tokens == 0 || routed_input_tokens == 0 ||
+      aligned_routing_index_count == 0 || ep_square == 0 ||
+      expert_bookkeeping_count == 0) {
+    return 0;
+  }
+
+  const int64_t hidden_workspace_bytes_per_output = checked_add(
+      checked_multiply(hidden_size, kBf16Bytes + kInt8Bytes),
+      2 * kFp32Bytes);
+  const int64_t output_workspace_bytes = checked_multiply(
+      max_output_size, hidden_workspace_bytes_per_output);
+  const int64_t routing_index_bytes =
+      checked_multiply(aligned_routing_index_count, kInt32Bytes);
+  const int64_t expert_bookkeeping_bytes = checked_multiply(
+      checked_multiply(expert_bookkeeping_count, kInt32Bytes), 2);
+  const int64_t soft_flag_bytes = checked_multiply(
+      checked_multiply(checked_add(local_experts, 2 * ep_world_size),
+                       kInt32Bytes),
+      kSoftFlagStride);
+  const int64_t routing_scratch_bytes = checked_multiply(
+      routed_input_tokens,
+      kRoutingSortBytesPerToken + kRoutingScatterBytesPerToken);
+  const int64_t routing_expert_flag_bytes =
+      checked_multiply(kRoutingAivCount, 2 * kInt32Bytes);
+  if (hidden_workspace_bytes_per_output == 0 || output_workspace_bytes == 0 ||
+      routing_index_bytes == 0 || expert_bookkeeping_bytes == 0 ||
+      soft_flag_bytes == 0 || routing_scratch_bytes == 0 ||
+      routing_expert_flag_bytes == 0) {
+    return 0;
+  }
+
+  int64_t coc_workspace_bytes = 0;
+  for (int64_t bytes : {routing_index_bytes,
+                        expert_bookkeeping_bytes,
+                        output_workspace_bytes,
+                        soft_flag_bytes}) {
+    coc_workspace_bytes = checked_add(coc_workspace_bytes, bytes);
+    if (coc_workspace_bytes == 0) {
+      return 0;
+    }
+  }
+  const int64_t init_routing_workspace_bytes = checked_add(
+      checked_add(routing_scratch_bytes, routing_expert_flag_bytes),
+      kRoutingSystemWorkspaceBytes);
+  const int64_t required_workspace_bytes = checked_add(
+      kRoutingSystemWorkspaceBytes,
+      std::max(coc_workspace_bytes, init_routing_workspace_bytes));
+  return checked_align_up(required_workspace_bytes, kWorkspaceAlignment);
 }
 
 inline int64_t calculate_staging_reservation_bytes(
