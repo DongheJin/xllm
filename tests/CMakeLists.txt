@@ -14,6 +14,22 @@ if(USE_NPU)
     python_executor_test
     PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
   )
+
+  # Run separately so tests/python runtime stubs cannot affect the probe.
+  add_test(
+    NAME python_hccl_decode_graph_test
+    COMMAND
+      "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
+      "${Python3_EXECUTABLE}" -m pytest -q
+      "${CMAKE_CURRENT_SOURCE_DIR}/npu/test_hccl_decode_graph.py"
+  )
+  set_tests_properties(
+    python_hccl_decode_graph_test
+    PROPERTIES
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      RUN_SERIAL TRUE
+  )
 endif()
 
 add_subdirectory(api_service)
