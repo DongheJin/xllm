@@ -174,6 +174,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._mla_graph_workspaces: dict[tuple[int, ...], torch.Tensor] = {}
         self._mla_graph_outputs: dict[tuple[int, ...], torch.Tensor] = {}
         self._mla_graph_lses: dict[tuple[int, ...], torch.Tensor] = {}
+        # CP MLA index contexts are requested once per decoder layer. Keep the
+        # segment-row block-table view for the current forward so every layer
+        # reuses the same contiguous tensor instead of launching another
+        # index_select and allocation.
+        self._mla_cp_block_tables: dict[tuple[int, int], torch.Tensor] = {}
         self._mla_quant_indexer_metadata: dict[tuple[int, int, int, int], torch.Tensor] = {}
         self._mla_max_seqlen_q = 0
         self._mla_max_seqlen_k = 0
@@ -362,6 +367,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         # Pre-cache MLA (sparse SFA) seq-lens once per step; shared by
         # execute_mla / mla_index_context instead of re-derived per layer.
+        self._mla_cp_block_tables.clear()
         self._mla_quant_indexer_metadata.clear()
         if self._is_mla and kv_seq_lens is not None:
             mla_device = kv_seq_lens.device
@@ -668,22 +674,26 @@ class NpuPagedAttentionBackend(AttentionBackend):
         slot_mapping = metadata.local_slot_mapping if metadata.has_kv_shard else metadata.slot_mapping
         if slot_mapping is None:
             raise RuntimeError("MLA index cache requires a slot mapping")
+        cp_context = get_forward_context().cp_context
+        block_table = self._block_table_i32
+        if cp_context is not None:
+            block_table = self._segment_block_table(block_table, cp_context)
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=slot_mapping,
-            block_table=self._block_table_i32,
-            actual_seq_q=self._mla_actual_seq_q,
-            actual_seq_kv=self._mla_actual_seq_kv,
+            block_table=block_table,
+            actual_seq_q=self._mla_actual_seq_q if cp_context is None else cp_context.q_cu_seqlens_tensor,
+            actual_seq_kv=self._mla_actual_seq_kv if cp_context is None else cp_context.segment_kv_seq_lens_tensor,
             index_cache_scale=index_cache_scale,
-            get_quant_indexer_metadata=lambda num_heads_q,
-            head_dim,
-            sparse_count,
-            cmp_ratio: self._get_quant_indexer_metadata(
-                num_heads_q,
-                index_cache.size(2),
-                head_dim,
-                sparse_count,
-                cmp_ratio,
+            get_quant_indexer_metadata=lambda num_heads_q, head_dim, sparse_count, cmp_ratio: (
+                self._get_quant_indexer_metadata(
+                    num_heads_q,
+                    index_cache.size(2),
+                    head_dim,
+                    sparse_count,
+                    cmp_ratio,
+                    cp_context,
+                )
             ),
             update_index_cache=lambda values, scales: self._update_mla_index_cache(
                 index_cache,
@@ -696,10 +706,32 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 index_cache,
                 index_cache_scale,
                 metadata,
-                get_forward_context().cp_context,
+                cp_context,
             ),
-            cp_context=get_forward_context().cp_context,
+            cp_context=cp_context,
         )
+
+    def _segment_block_table(
+        self,
+        block_table: torch.Tensor,
+        cp_context: CpContext,
+    ) -> torch.Tensor:
+        """Return the cached block-table rows for this CP segment layout."""
+        # Keep this helper usable by lightweight test doubles that bypass
+        # ``__init__`` while retaining the normal per-forward cache on the
+        # production backend.
+        cache = getattr(self, "_mla_cp_block_tables", None)
+        if cache is None:
+            cache = {}
+            self._mla_cp_block_tables = cache
+        cache_key = (id(cp_context), id(block_table))
+        segmented = cache.get(cache_key)
+        if segmented is None:
+            segmented = block_table.index_select(
+                0, cp_context.segment_seq_indices
+            ).contiguous()
+            cache[cache_key] = segmented
+        return segmented
 
     def _get_quant_indexer_metadata(
         self,
@@ -708,20 +740,34 @@ class NpuPagedAttentionBackend(AttentionBackend):
         head_dim: int,
         sparse_count: int,
         cmp_ratio: int,
+        cp_context: CpContext | None = None,
     ) -> torch.Tensor:
         assert self._mla_actual_seq_q is not None
         assert self._mla_actual_seq_kv is not None
         cache_key = (num_heads_q, head_dim, sparse_count, cmp_ratio)
         metadata = self._mla_quant_indexer_metadata.get(cache_key)
         if metadata is None:
+            actual_seq_q = self._mla_actual_seq_q
+            actual_seq_kv = self._mla_actual_seq_kv
+            max_seqlen_q = self._mla_max_seqlen_q
+            max_seqlen_k = self._mla_max_seqlen_k
+            if cp_context is not None:
+                actual_seq_q = cp_context.q_cu_seqlens_tensor
+                actual_seq_kv = cp_context.segment_kv_seq_lens_tensor
+                ends = cp_context.q_cu_seqlens
+                max_seqlen_q = max(
+                    (end - (ends[index - 1] if index else 0) for index, end in enumerate(ends)),
+                    default=0,
+                )
+                max_seqlen_k = max(cp_context.segment_kv_seq_lens, default=0)
             metadata = kernels.quant_lightning_indexer_metadata(
                 num_heads_q,
                 num_heads_k,
                 head_dim,
-                self._mla_actual_seq_q,
-                self._mla_actual_seq_kv,
-                self._mla_max_seqlen_q,
-                self._mla_max_seqlen_k,
+                actual_seq_q,
+                actual_seq_kv,
+                max_seqlen_q,
+                max_seqlen_k,
                 sparse_count,
                 cmp_ratio,
             )
@@ -795,6 +841,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 metadata,
                 cp_context,
             )
+        if cp_context is not None:
+            block_table = self._segment_block_table(block_table, cp_context)
         return materialized_cache, materialized_scale, block_table
 
     def _materialize_sfa_layout(
