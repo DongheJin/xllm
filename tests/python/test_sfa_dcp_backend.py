@@ -99,3 +99,71 @@ def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes() -> None:
     assert (expanded[-1] >= 0).all()
     assert torch.equal(expanded[-1], torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32))
     assert torch.equal(expanded[0, :4], torch.tensor([4, 5, 6, 7], dtype=torch.int32))
+
+
+def test_prepare_uses_expanded_rows_for_mtp_verify() -> None:
+    backend = SfaDcpAttentionBackend(
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=256,
+        scale=0.1,
+        sliding_window=0,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        dcp_group=_FakeDcpGroup(),
+        index_topk=2048,
+        max_num_reqs=8,
+    )
+    page_size = 128
+    backend.bind_kv_caches(
+        [
+            LayerCache(
+                key=torch.empty(16, page_size, 1, 512),
+                value=torch.empty(16, page_size, 1, 64),
+                index=torch.empty(64, page_size, 1, 128),
+            )
+        ]
+    )
+
+    captured: dict[str, object] = {}
+
+    class _Builder:
+        dcp_local_seq_lens_buf = torch.empty(8)
+
+        @staticmethod
+        def build(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(dcp_context=SimpleNamespace())
+
+    backend._builder = _Builder()
+    metadata = SimpleNamespace(
+        slot_mapping=torch.arange(4, dtype=torch.int32),
+        block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([4, 8], dtype=torch.int32),
+        kv_seq_lens_host_values=[4, 8],
+        q_cu_seq_lens=None,
+        q_seq_lens=None,
+        expanded_decode_metadata=SimpleNamespace(
+            enabled=True,
+            kv_seq_lens=torch.tensor([3, 4, 7, 8], dtype=torch.int32),
+            block_table=torch.tensor(
+                [[10, 11], [10, 11], [20, 21], [20, 21]], dtype=torch.int32
+            ),
+            paged_kv_indptr=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
+            paged_kv_indices=torch.tensor([10, 10, 20, 21, 20, 21], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([3, 4, 3, 4], dtype=torch.int32),
+            paged_attention_tiling_data=None,
+            kv_seq_lens_host=None,
+            kv_seq_lens_host_values=[3, 4, 7, 8],
+        ),
+        is_prefill=False,
+        is_chunked_prefill=False,
+    )
+
+    with forward_context(_cpu_context(AclGraphExecutionState({}))):
+        backend.prepare(metadata, graph_mode=True)
+
+    assert captured["num_reqs"] == 4
+    assert captured["num_input_tokens"] == 4
+    assert captured["seq_lens"].tolist() == [3, 4, 7, 8]
+    assert captured["block_table"].shape == (4, 2)
