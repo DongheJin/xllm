@@ -27,6 +27,9 @@ from xllm.python.registry import get_model_class  # noqa: E402
 
 def test_glm_mtp_registry_resolves_python_draft() -> None:
     assert get_model_class("glm_moe_dsa_mtp") is Glm52MtpForCausalLM
+    # export_mtp.py writes this HF architecture name into the generated
+    # config; keep the architecture and model_type entry points equivalent.
+    assert get_model_class("GlmMoeDsaMtpForCausalLM") is Glm52MtpForCausalLM
 
 
 def test_glm_mtp_config_uses_nextn_layers_and_glm_dimensions() -> None:
