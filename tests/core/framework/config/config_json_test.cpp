@@ -244,17 +244,7 @@ TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
                    .has_value());
 }
 
-TEST(ModelConfigValidationTest, RejectsGlmPythonMtpBeforeDraftLoading) {
-  const std::optional<std::string> error =
-      ModelConfig::validate_python_speculative_decode(
-          "python", "glm_moe_dsa", /*num_speculative_tokens=*/4, "MTP");
-
-  ASSERT_TRUE(error.has_value());
-  EXPECT_NE(error->find("glm_moe_dsa_mtp"), std::string::npos);
-  EXPECT_NE(error->find("native model executor"), std::string::npos);
-}
-
-TEST(ModelConfigValidationTest, GlmMtpGatePreservesOtherExecutionModes) {
+TEST(ModelConfigValidationTest, GlmMtpUsesPythonDraftRegistration) {
   struct Case {
     std::string_view model_impl;
     std::string_view algorithm;
@@ -262,9 +252,9 @@ TEST(ModelConfigValidationTest, GlmMtpGatePreservesOtherExecutionModes) {
     bool rejected;
   };
   const Case cases[] = {
-      {"python", "MTP", 4, true},
-      {"py", "Mtp", 4, true},
-      {"python", "mtp", 1, true},
+      {"python", "MTP", 4, false},
+      {"py", "Mtp", 4, false},
+      {"python", "mtp", 1, false},
       {"native", "MTP", 4, false},
       {"python", "MTP", 0, false},
       {"python", "Eagle3", 4, false},
