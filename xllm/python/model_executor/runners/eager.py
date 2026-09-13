@@ -42,6 +42,9 @@ def _per_seq_lens_from_metadata(
     kv_lens = metadata.kv_seq_lens_host if include_prefix else q_lens
     if q_lens is None or kv_lens is None:
         return None
+    for name, lengths in (("query", q_lens), ("KV", kv_lens)):
+        if lengths.device.type != "cpu" or lengths.ndim != 1 or lengths.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"CP {name} host lengths must be a CPU int32/int64 vector")
     return q_lens.tolist(), kv_lens.tolist()
 
 

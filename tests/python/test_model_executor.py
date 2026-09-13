@@ -1170,6 +1170,36 @@ def test_eager_runner_rejects_missing_cp_lengths(
     assert not runner.attention_backend._prepared
 
 
+@pytest.mark.parametrize(
+    "bad_lengths",
+    [
+        torch.empty(1, dtype=torch.int32, device="meta"),
+        torch.tensor([[1]], dtype=torch.int32),
+        torch.tensor([1.5], dtype=torch.float32),
+    ],
+)
+@pytest.mark.parametrize("field", ["q_seq_lens_host", "kv_seq_lens_host"])
+def test_cp_rejects_invalid_host_lengths_before_prepare(bad_lengths: torch.Tensor, field: str) -> None:
+    runner = _make_eager_runner()
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+    )
+    setattr(metadata, field, bad_lengths)
+    with (
+        patch("xllm.python.model_executor.runners.eager.build_cp_context") as build_context,
+        pytest.raises(ValueError, match="CPU int32/int64 vector"),
+    ):
+        runner.execute(torch.zeros(1), torch.zeros(1), metadata)
+    build_context.assert_not_called()
+    assert not runner.attention_backend._prepared
+    runner.model.assert_not_called()
+
+
 class TestExecuteRouting:
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
