@@ -199,6 +199,24 @@ class W8A8WeightLoader(WeightLoader):
                 t = self.shard(t, dim=dim)
             self.copy_in(prefix + proj + "." + suffix, t)
 
+    def load_w8a8_dynamic_projection(
+        self, prefix: str, proj: str, shard_dims: Optional[dict[str, int]] = None
+    ) -> None:
+        """Load a dynamic-activation W8A8 projection.
+
+        Dynamic checkpoints store per-output-channel ``weight_scale`` and
+        ``weight_offset`` tensors.  Keeping this beside the static loader makes
+        the checkpoint format choice explicit at each model call site and
+        avoids accidentally requesting static-only ``deq_scale`` tensors.
+        """
+        dims = shard_dims or {}
+        for suffix in ("weight", "weight_scale", "weight_offset"):
+            t = self.load_tensor(prefix + proj + "." + suffix)
+            dim = dims.get(suffix)
+            if dim is not None:
+                t = self.shard(t, dim=dim)
+            self.copy_in(prefix + proj + "." + suffix, t)
+
     def load_fused_w8a8_projection(
         self,
         prefix: str,

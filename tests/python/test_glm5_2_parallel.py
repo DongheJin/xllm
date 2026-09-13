@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from xllm.python.models import glm5_2
+from xllm.python.models.deepseek_v32 import W8A8DynamicLinear, W8A8StaticLinear
 from xllm.python.models.glm5_2 import Glm52Config, Glm52ForCausalLM
 from xllm.python.models.weight_utils import W8A8WeightLoader
 
@@ -126,6 +127,20 @@ def test_glm_layerwise_split_cannot_overlap_context_parallel() -> None:
     )
     with pytest.raises(ValueError, match="CP and layerwise"):
         cfg.validate()
+
+
+def test_glm_dynamic_checkpoint_switches_attention_projections() -> None:
+    model = Glm52ForCausalLM(_config(first_k_dense_replace=1, indexer_types=["full"]))
+    probe = MagicMock()
+    probe.has.return_value = True
+
+    assert model._configure_attention_quantization(probe) is True
+    attn = model.model.layers[0].self_attn
+    for name in ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"):
+        assert isinstance(getattr(attn, name), W8A8DynamicLinear)
+        assert not isinstance(getattr(attn, name), W8A8StaticLinear)
+    assert attn.indexer is not None
+    assert isinstance(attn.indexer.wq_b, W8A8DynamicLinear)
 
 
 @pytest.mark.parametrize(

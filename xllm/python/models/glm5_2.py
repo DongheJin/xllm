@@ -63,6 +63,7 @@ from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3MLP,
     DeepseekV3MoE,
+    W8A8DynamicLinear,
     W8A8StaticLinear,
     _apply_half_rope,
     _create_hadamard_matrix,
@@ -883,6 +884,22 @@ class Glm52ForCausalLM(PyModelBase):
         cfg = self.cfg
         loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
 
+        # GLM-5.3 checkpoints use the dynamic W8A8 format for the MLA and
+        # indexer projections (weight + weight_scale + weight_offset), while
+        # earlier GLM-5.2 exports used static W8A8 (deq_scale/quant_bias and
+        # input_scale/input_offset).  The Python model is constructed before
+        # the checkpoint is handed to us, so switch the projection modules
+        # before taking the loader's parameter snapshot.
+        dynamic_w8a8 = self._configure_attention_quantization(loader)
+        if dynamic_w8a8:
+            loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
+
+        def load_projection(prefix: str, proj: str, shard_dims: dict | None = None) -> None:
+            if dynamic_w8a8:
+                loader.load_w8a8_dynamic_projection(prefix, proj, shard_dims)
+            else:
+                loader.load_w8a8_projection(prefix, proj, shard_dims)
+
         loader.copy_shard("model.embed_tokens.weight", dim=1)
 
         for i in range(cfg.n_layers):
@@ -890,16 +907,22 @@ class Glm52ForCausalLM(PyModelBase):
             loader.copy_replicated(p + "input_layernorm.weight")
             loader.copy_replicated(p + "post_attention_layernorm.weight")
             attn = p + "self_attn."
-            loader.load_w8a8_projection(attn, "q_a_proj")
+            load_projection(attn, "q_a_proj")
             loader.copy_replicated(attn + "q_a_layernorm.weight")
-            loader.load_w8a8_projection(attn, "q_b_proj", {"weight": 0, "deq_scale": 0, "quant_bias": 0})
-            loader.load_w8a8_projection(attn, "kv_a_proj_with_mqa")
+            load_projection(
+                attn,
+                "q_b_proj",
+                {"weight": 0, "deq_scale": 0, "quant_bias": 0, "weight_scale": 0, "weight_offset": 0},
+            )
+            load_projection(attn, "kv_a_proj_with_mqa")
             loader.copy_replicated(attn + "kv_a_layernorm.weight")
             loader.copy_shard(attn + "kv_b_proj.weight", dim=0)
-            loader.load_w8a8_projection(attn, "o_proj", {"weight": 1})
+            # Row-parallel o_proj shards only its input dimension.  The
+            # per-output-channel dynamic scales/offsets stay replicated.
+            load_projection(attn, "o_proj", {"weight": 1})
             if not self.model.layers[i].self_attn.is_shared:
                 idx = attn + "indexer."
-                loader.load_w8a8_projection(idx, "wq_b")
+                load_projection(idx, "wq_b")
                 loader.copy_replicated(idx + "wk.weight")
                 loader.copy_replicated(idx + "k_norm.weight")
                 loader.copy_replicated(idx + "k_norm.bias")
@@ -910,3 +933,34 @@ class Glm52ForCausalLM(PyModelBase):
 
         loader.copy_replicated("model.norm.weight")
         loader.copy_shard("lm_head.weight", dim=0)
+
+    def _configure_attention_quantization(self, loader: W8A8WeightLoader) -> bool:
+        """Replace static attention modules when the checkpoint is W8A8 dynamic."""
+        dynamic = loader.has("model.layers.0.self_attn.q_a_proj.weight_scale")
+        if not dynamic:
+            return False
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            for name in ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"):
+                module = getattr(attn, name)
+                if isinstance(module, W8A8DynamicLinear):
+                    continue
+                setattr(
+                    attn,
+                    name,
+                    W8A8DynamicLinear(
+                        module.in_features,
+                        module.out_features,
+                        module.weight.device,
+                        transpose_weight_after_loading=True,
+                    ),
+                )
+            if attn.indexer is not None and not isinstance(attn.indexer.wq_b, W8A8DynamicLinear):
+                module = attn.indexer.wq_b
+                attn.indexer.wq_b = W8A8DynamicLinear(
+                    module.in_features,
+                    module.out_features,
+                    module.weight.device,
+                    transpose_weight_after_loading=True,
+                )
+        return True
