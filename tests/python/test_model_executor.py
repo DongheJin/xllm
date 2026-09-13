@@ -897,6 +897,40 @@ class TestDecodeAclGraphSpeculativeMetadata:
         current_stream.wait_stream.assert_called_once_with(replay_stream)
         graph.replay.assert_called_once_with()
 
+    def test_graph_buffer_update_waits_for_previous_replay(self) -> None:
+        runner = self._runner()
+        metadata = self._metadata()
+        entry = SimpleNamespace(
+            graph=MagicMock(),
+            static_metadata=SimpleNamespace(),
+            execution_state=SimpleNamespace(persistent_buffers={}),
+        )
+        runner._graphs[runner._graph_key(4, True, None)] = entry
+        replay_stream = MagicMock()
+        update_stream = MagicMock()
+        replay_done_event = MagicMock()
+        current_stream = MagicMock()
+        runner._stream = replay_stream
+        runner._update_stream = update_stream
+        runner._replay_done_event = replay_done_event
+        runner.attention_backend.prepare = MagicMock()
+        fake_npu = SimpleNamespace(current_stream=MagicMock(return_value=current_stream))
+
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(runner, "_fill_entry") as fill_entry,
+        ):
+            result = runner._prepare_graph_entry(
+                torch.arange(4, dtype=torch.int32),
+                torch.arange(4, dtype=torch.int32),
+                metadata,
+                None,
+            )
+
+        assert result is entry
+        current_stream.wait_event.assert_called_once_with(replay_done_event)
+        fill_entry.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.bind_kv_caches
