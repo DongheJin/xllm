@@ -585,6 +585,15 @@ class DecodeAclGraphRunner(BaseRunner):
             )
             self._replay_done_event = torch.npu.Event()
 
+        # The previous replay may still be reading the capture buffers on the
+        # graph stream while the scheduler prepares the next step on the
+        # current stream.  Wait before mutating static inputs/metadata; the
+        # later graph-stream wait only orders the new replay after these
+        # writes and cannot protect this earlier update.
+        if entry.graph is not None:
+            assert self._replay_done_event is not None
+            torch.npu.current_stream().wait_event(self._replay_done_event)
+
         self._fill_entry(
             entry,
             input_ids,
