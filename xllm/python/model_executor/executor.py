@@ -126,6 +126,10 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        cp_size = int(config.get("cp_size", 1))
+        dp_size = int(config.get("dp_size", 1))
+        if cp_size > 1 and dp_size > 1:
+            raise NotImplementedError("Python CP requires dp_size == 1")
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
@@ -152,7 +156,7 @@ class ModelExecutor:
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
         # Context-Parallel: shard prefill sequences across the CP group. Decode
         # stays on the non-CP path (CP is prefill-only, eager-only in v1).
-        self.eager_runner.cp_size = int(config.get("cp_size", 1))
+        self.eager_runner.cp_size = cp_size
         self.eager_runner.cp_rank = int(config.get("cp_rank", 0))
         self.layerwise_split_size = int(config.get("layerwise_split_size", 1))
         self.layerwise_split_rank = int(config.get("layerwise_split_rank", 0))
@@ -167,7 +171,6 @@ class ModelExecutor:
                 "Python GLM5.2 layerwise split requires eager execution; "
                 f"graph backend '{graph_backend}' is not supported."
             )
-        dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
         if dp_size > 1 and graph_backend not in (

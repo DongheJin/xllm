@@ -421,6 +421,15 @@ class TestModelExecutorConstruction:
                 max_seqs_per_batch=4,
             )
 
+    @patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend())
+    def test_context_parallel_rejects_data_parallel_combination(self, _mock_create):
+        with pytest.raises(NotImplementedError, match="Python CP requires dp_size == 1"):
+            ModelExecutor(
+                _FakeModel(num_layers=1),
+                {"cp_size": 2, "dp_size": 2, "python_graph_backend": "off"},
+                max_seqs_per_batch=4,
+            )
+
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_acl_graph_capacity_respects_decode_batch_limit(
