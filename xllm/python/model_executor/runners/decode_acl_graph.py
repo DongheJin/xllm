@@ -793,7 +793,26 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         linear_state_indices = getattr(metadata, "linear_state_indices", None)
         if linear_state_indices is not None:
-            static_metadata.linear_state_indices[:batch_size].copy_(linear_state_indices)
+            # MTP metadata carries one state index per sequence while the
+            # decode graph input is expanded to one row per speculative token.
+            # Repeat each sequence index across its token rows before copying
+            # into the token-shaped persistent buffer.
+            if linear_state_indices.numel() < batch_size:
+                if batch_size % linear_state_indices.numel() != 0:
+                    raise RuntimeError(
+                        "ACL graph MTP linear_state_indices must divide the "
+                        f"expanded token count (tokens={batch_size}, "
+                        f"sequences={linear_state_indices.numel()})"
+                    )
+                repeat_count = batch_size // linear_state_indices.numel()
+                linear_state_indices = linear_state_indices.repeat_interleave(repeat_count)
+            if linear_state_indices.numel() < batch_size:
+                raise RuntimeError(
+                    "ACL graph linear_state_indices must contain one value "
+                    f"per decode row (rows={batch_size}, "
+                    f"values={linear_state_indices.numel()})"
+                )
+            static_metadata.linear_state_indices[:batch_size].copy_(linear_state_indices[:batch_size])
         if padded_batch_size > batch_size:
             static_metadata.linear_state_indices[batch_size:].zero_()
         self._fill_host_metadata(entry, kv_seq_lens_host_values, batch_size)

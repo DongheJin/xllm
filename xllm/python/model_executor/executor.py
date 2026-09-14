@@ -143,13 +143,14 @@ class ModelExecutor:
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
+        num_decoding_tokens = max(1, int(num_decoding_tokens))
         self._num_attention_layers = len(attention_layers)
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
             first_parameter.dtype,
             config,
-            max_seqs_per_batch,
+            max(max_seqs_per_batch, 1) * num_decoding_tokens,
         )
 
         execution_model = model.model
@@ -203,7 +204,6 @@ class ModelExecutor:
                 DecodeAclGraphRunner,
             )
 
-            num_decoding_tokens = max(1, int(num_decoding_tokens))
             decode_batch_size_limit = (
                 None if acl_graph_decode_batch_size_limit is None else max(1, int(acl_graph_decode_batch_size_limit))
             )

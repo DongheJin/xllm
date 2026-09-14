@@ -451,6 +451,10 @@ class TestModelExecutorConstruction:
             acl_graph_decode_batch_size_limit=16,
         )
 
+        # The SFA-DCP metadata builder is token-row based. MTP expands each
+        # sequence into num_decoding_tokens rows, so its capacity must cover
+        # the expanded graph input as well.
+        assert mock_create.call_args.args[-1] == 256 * 4
         mock_graph_runner.assert_called_once_with(
             model.model,
             mock_create.return_value,

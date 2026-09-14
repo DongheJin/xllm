@@ -100,6 +100,51 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
 
 
+def test_mtp_linear_state_indices_repeat_for_expanded_rows() -> None:
+    runner = _runner()
+    input_ids = torch.arange(4, dtype=torch.int32)
+    positions = torch.arange(4, dtype=torch.int32)
+    metadata = _metadata(torch.tensor([3, 7], dtype=torch.int32))
+    metadata.slot_mapping = torch.arange(4, dtype=torch.int32)
+    metadata.block_table = torch.tensor([[10, 0], [20, 0], [30, 0], [40, 0]], dtype=torch.int32)
+    metadata.kv_seq_lens = torch.arange(1, 5, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [1, 2, 3, 4]
+    metadata.paged_kv_indptr = torch.arange(5, dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.arange(1, 5, dtype=torch.int32)
+    metadata.expanded_decode_metadata = SimpleNamespace(
+        enabled=True,
+        kv_seq_lens=metadata.kv_seq_lens,
+        block_table=metadata.block_table,
+        paged_kv_indptr=metadata.paged_kv_indptr,
+        paged_kv_indices=metadata.paged_kv_indices,
+        paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
+    )
+    entry = runner._allocate_entry(
+        padded_batch_size=4,
+        input_ids=input_ids,
+        positions=positions,
+        metadata=metadata,
+    )
+
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+        create=True,
+    ):
+        runner._fill_entry(
+            entry,
+            input_ids,
+            positions,
+            metadata,
+            batch_size=4,
+            input_embedding=None,
+        )
+
+    assert entry.static_metadata.linear_state_indices.tolist() == [3, 3, 7, 7]
+
+
 def _dp_metadata(
     token_counts: tuple[int, int],
     dp_is_decode: tuple[int, int] = (1, 1),
