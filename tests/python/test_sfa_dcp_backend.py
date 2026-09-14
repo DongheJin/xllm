@@ -146,9 +146,7 @@ def test_prepare_uses_expanded_rows_for_mtp_verify() -> None:
         expanded_decode_metadata=SimpleNamespace(
             enabled=True,
             kv_seq_lens=torch.tensor([3, 4, 7, 8], dtype=torch.int32),
-            block_table=torch.tensor(
-                [[10, 11], [10, 11], [20, 21], [20, 21]], dtype=torch.int32
-            ),
+            block_table=torch.tensor([[10, 11], [10, 11], [20, 21], [20, 21]], dtype=torch.int32),
             paged_kv_indptr=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
             paged_kv_indices=torch.tensor([10, 10, 20, 21, 20, 21], dtype=torch.int32),
             paged_kv_last_page_len=torch.tensor([3, 4, 3, 4], dtype=torch.int32),

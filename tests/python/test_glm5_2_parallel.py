@@ -132,7 +132,7 @@ def test_glm_layerwise_split_cannot_overlap_context_parallel() -> None:
 def test_glm_dynamic_checkpoint_switches_attention_projections() -> None:
     model = Glm52ForCausalLM(_config(first_k_dense_replace=1, indexer_types=["full"]))
     probe = MagicMock()
-    probe.has.return_value = True
+    probe.has.side_effect = lambda name: name.endswith("weight_scale")
 
     assert model._configure_attention_quantization(probe) is True
     attn = model.model.layers[0].self_attn
@@ -141,6 +141,115 @@ def test_glm_dynamic_checkpoint_switches_attention_projections() -> None:
         assert not isinstance(getattr(attn, name), W8A8StaticLinear)
     assert attn.indexer is not None
     assert isinstance(attn.indexer.wq_b, W8A8DynamicLinear)
+
+
+class _TensorStateDict:
+    def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
+        self.tensors = tensors
+
+    def has(self, name: str) -> bool:
+        return name in self.tensors
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return self.tensors[name]
+
+
+def _quantized_checkpoint(dynamic_projections: set[str]) -> _TensorStateDict:
+    """Build a full, unsharded checkpoint with distinct channel values."""
+    model = Glm52ForCausalLM(
+        _config(
+            tp_size=1,
+            dp_size=1,
+            world_size=1,
+            ep_size=1,
+            num_hidden_layers=2,
+            first_k_dense_replace=2,
+            indexer_types=["full", "full"],
+        )
+    )
+    tensors = {}
+    for name, value in model.state_dict().items():
+        tensor = (torch.arange(value.numel()).reshape(value.shape) % 97 + 1).to(value.dtype)
+        if name.endswith("weight_offset"):
+            tensor.zero_()
+        if ".gate_up_proj." in name:
+            gate, up = tensor.chunk(2, dim=0)
+            tensors[name.replace("gate_up_proj", "gate_proj")] = gate.clone()
+            tensors[name.replace("gate_up_proj", "up_proj")] = up.clone()
+        else:
+            tensors[name] = tensor
+    for prefix in dynamic_projections:
+        out_features = tensors[prefix + ".weight"].shape[0]
+        for suffix in ("deq_scale", "quant_bias", "input_scale", "input_offset"):
+            tensors.pop(prefix + "." + suffix)
+        tensors[prefix + ".weight_scale"] = torch.arange(1, out_features + 1, dtype=torch.float32).view(-1, 1) / 128
+        tensors[prefix + ".weight_offset"] = torch.zeros(out_features, 1)
+    return _TensorStateDict(tensors)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_glm_dynamic_projection_shards_match_checkpoint(monkeypatch, tp_rank: int, mixed: bool) -> None:
+    projections = ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj", "indexer.wq_b")
+    dynamic = {
+        f"model.layers.{layer}.self_attn.{proj}"
+        for layer in range(2)
+        for proj in projections
+        if not mixed or (layer == 1 and proj in ("q_b_proj", "o_proj", "indexer.wq_b"))
+    }
+    checkpoint = _quantized_checkpoint(dynamic)
+    model = Glm52ForCausalLM(
+        _config(
+            tp_rank=tp_rank,
+            dp_size=1,
+            world_size=2,
+            ep_size=1,
+            num_hidden_layers=2,
+            first_k_dense_replace=2,
+            indexer_types=["full", "full"],
+        )
+    )
+    # Keep the actual loader, shape checks and post-load processing; only
+    # replace the device-specific NZ conversion with its logical transpose.
+    monkeypatch.setattr(glm5_2.kernels, "prepare_quant_weight", lambda w: w.t().contiguous(), raising=False)
+
+    model.load_weights([checkpoint], tp_rank=tp_rank, tp_size=2)
+
+    for prefix in dynamic:
+        proj = model.get_submodule(prefix)
+        assert isinstance(proj, W8A8DynamicLinear)
+        weight = checkpoint.get_tensor(prefix + ".weight")
+        scale = checkpoint.get_tensor(prefix + ".weight_scale").flatten()
+        offset = checkpoint.get_tensor(prefix + ".weight_offset").flatten()
+        if prefix.endswith(".o_proj"):
+            weight = weight.chunk(2, dim=1)[tp_rank]
+        elif prefix.endswith(".q_b_proj"):
+            weight = weight.chunk(2, dim=0)[tp_rank]
+            scale = scale.chunk(2)[tp_rank]
+            offset = offset.chunk(2)[tp_rank]
+        torch.testing.assert_close(proj.weight, weight.t().contiguous())
+        torch.testing.assert_close(proj.weight_scale, scale)
+        torch.testing.assert_close(proj.weight_offset, offset)
+    if mixed:
+        assert isinstance(model.model.layers[0].self_attn.q_a_proj, W8A8StaticLinear)
+        assert isinstance(model.model.layers[1].self_attn.kv_a_proj_with_mqa, W8A8StaticLinear)
+
+
+def test_glm_static_checkpoint_with_weight_scale_remains_static() -> None:
+    model = Glm52ForCausalLM(_config(first_k_dense_replace=1, indexer_types=["full"]))
+    prefix = "model.layers.0.self_attn.q_a_proj."
+    checkpoint = _TensorStateDict({prefix + "deq_scale": torch.ones(8), prefix + "weight_scale": torch.ones(8, 1)})
+    loader = W8A8WeightLoader(model, [checkpoint], 2, 0)
+
+    assert model._configure_attention_quantization(loader) is False
+    assert isinstance(model.model.layers[0].self_attn.q_a_proj, W8A8StaticLinear)
+
+
+def test_glm_dynamic_projection_rejects_nonzero_weight_offset() -> None:
+    proj = W8A8DynamicLinear(8, 4, torch.device("cpu"))
+    proj.weight_offset.fill_(1)
+    with pytest.raises(ValueError, match="zero weight_offset"):
+        proj.process_weights_after_loading()
 
 
 @pytest.mark.parametrize(

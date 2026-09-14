@@ -842,7 +842,7 @@ class Glm52Model(nn.Module):
 class Glm52ForCausalLM(PyModelBase):
     """GLM-5.2 causal LM. Registered under ``model_type='glm_moe_dsa'``."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, build_model: bool = True) -> None:
         super().__init__()
         self.cfg = Glm52Config.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
@@ -865,6 +865,8 @@ class Glm52ForCausalLM(PyModelBase):
         self.device = device
         tp = self.cfg.tp_size
         assert self.cfg.vocab_size % tp == 0
+        if not build_model:
+            return
         self.model = Glm52Model(self.cfg, dtype, device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size,
@@ -880,27 +882,27 @@ class Glm52ForCausalLM(PyModelBase):
         state_dicts: list,
         tp_rank: int,
         tp_size: int,
+        load_lm_head: bool = True,
+        load_embedding: bool = True,
+        loader: W8A8WeightLoader | None = None,
     ) -> None:
         cfg = self.cfg
-        loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
-
-        # GLM-5.3 checkpoints use the dynamic W8A8 format for the MLA and
-        # indexer projections (weight + weight_scale + weight_offset), while
-        # earlier GLM-5.2 exports used static W8A8 (deq_scale/quant_bias and
-        # input_scale/input_offset).  The Python model is constructed before
-        # the checkpoint is handed to us, so switch the projection modules
-        # before taking the loader's parameter snapshot.
-        dynamic_w8a8 = self._configure_attention_quantization(loader)
-        if dynamic_w8a8:
+        if loader is None:
             loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
 
+        # The checkpoint arrives after model construction. Select the W8A8
+        # scheme per projection, then refresh destinations for replaced modules.
+        if self._configure_attention_quantization(loader):
+            loader.refresh_tensors(self)
+
         def load_projection(prefix: str, proj: str, shard_dims: dict | None = None) -> None:
-            if dynamic_w8a8:
+            if isinstance(self.get_submodule(prefix + proj), W8A8DynamicLinear):
                 loader.load_w8a8_dynamic_projection(prefix, proj, shard_dims)
             else:
                 loader.load_w8a8_projection(prefix, proj, shard_dims)
 
-        loader.copy_shard("model.embed_tokens.weight", dim=1)
+        if load_embedding:
+            loader.copy_shard("model.embed_tokens.weight", dim=1)
 
         for i in range(cfg.n_layers):
             p = f"model.layers.{i}."
@@ -932,21 +934,34 @@ class Glm52ForCausalLM(PyModelBase):
             self.model.layers[i].mlp.load_from_checkpoint(loader, p + "mlp.")
 
         loader.copy_replicated("model.norm.weight")
-        loader.copy_shard("lm_head.weight", dim=0)
+        if load_lm_head:
+            loader.copy_shard("lm_head.weight", dim=0)
 
     def _configure_attention_quantization(self, loader: W8A8WeightLoader) -> bool:
-        """Replace static attention modules when the checkpoint is W8A8 dynamic."""
-        dynamic = loader.has("model.layers.0.self_attn.q_a_proj.weight_scale")
-        if not dynamic:
-            return False
-        for layer in self.model.layers:
+        """Select each projection's scheme from its checkpoint tensor layout.
+
+        Static exports can include weight_scale alongside deq_scale. Prefer
+        their static operator contract; weight_scale alone must not switch
+        them, or unrelated layers, to dynamic activation quantization.
+        """
+        changed = False
+        for layer_id, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            for name in ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"):
-                module = getattr(attn, name)
+            projections = [(attn, name) for name in ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj")]
+            if attn.indexer is not None:
+                projections.append((attn.indexer, "wq_b"))
+            for parent, name in projections:
+                prefix = f"model.layers.{layer_id}.self_attn."
+                if parent is attn.indexer:
+                    prefix += "indexer."
+                prefix += name + "."
+                if loader.has(prefix + "deq_scale") or not loader.has(prefix + "weight_scale"):
+                    continue
+                module = getattr(parent, name)
                 if isinstance(module, W8A8DynamicLinear):
                     continue
                 setattr(
-                    attn,
+                    parent,
                     name,
                     W8A8DynamicLinear(
                         module.in_features,
@@ -955,12 +970,5 @@ class Glm52ForCausalLM(PyModelBase):
                         transpose_weight_after_loading=True,
                     ),
                 )
-            if attn.indexer is not None and not isinstance(attn.indexer.wq_b, W8A8DynamicLinear):
-                module = attn.indexer.wq_b
-                attn.indexer.wq_b = W8A8DynamicLinear(
-                    module.in_features,
-                    module.out_features,
-                    module.weight.device,
-                    transpose_weight_after_loading=True,
-                )
-        return True
+                changed = True
+        return changed

@@ -85,14 +85,18 @@ class WeightLoader:
         # Snapshot params/buffers by name; callers must mutate ``.data`` in
         # place rather than reassigning parameters (e.g. via ``setattr``), or
         # this cache goes stale.
-        self._tensors_by_name: dict[str, torch.Tensor] = dict(model.named_parameters())
-        self._tensors_by_name.update(model.named_buffers())
+        self.refresh_tensors(model)
         self._state_dicts = state_dicts
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self._src_prefixes = tuple(src_prefixes)
         # Lookup order per requested name: alias list (if mapped) → src prefixes → state dicts.
         self._name_aliases: Mapping[str, Sequence[str]] = name_aliases or {}
+
+    def refresh_tensors(self, model: nn.Module) -> None:
+        """Refresh destinations after choosing checkpoint-dependent modules."""
+        self._tensors_by_name: dict[str, torch.Tensor] = dict(model.named_parameters())
+        self._tensors_by_name.update(model.named_buffers())
 
     def _resolve(self, name: str) -> Optional[tuple[StateDict, str]]:
         """First present ``(state_dict, resolved_name)``: tries each ``src_prefix``
@@ -199,9 +203,7 @@ class W8A8WeightLoader(WeightLoader):
                 t = self.shard(t, dim=dim)
             self.copy_in(prefix + proj + "." + suffix, t)
 
-    def load_w8a8_dynamic_projection(
-        self, prefix: str, proj: str, shard_dims: Optional[dict[str, int]] = None
-    ) -> None:
+    def load_w8a8_dynamic_projection(self, prefix: str, proj: str, shard_dims: Optional[dict[str, int]] = None) -> None:
         """Load a dynamic-activation W8A8 projection.
 
         Dynamic checkpoints store per-output-channel ``weight_scale`` and

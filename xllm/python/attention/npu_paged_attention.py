@@ -727,9 +727,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         cache_key = (id(cp_context), id(block_table))
         segmented = cache.get(cache_key)
         if segmented is None:
-            segmented = block_table.index_select(
-                0, cp_context.segment_seq_indices
-            ).contiguous()
+            segmented = block_table.index_select(0, cp_context.segment_seq_indices).contiguous()
             cache[cache_key] = segmented
         return segmented
 
