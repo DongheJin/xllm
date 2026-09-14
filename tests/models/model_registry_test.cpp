@@ -54,5 +54,23 @@ TEST(ModelRegistryTest, DeepseekV4DSparkUsesTorchBackend) {
             "--npu_kernel_backend=TORCH.");
 }
 
+TEST(ModelRegistryTest, GlmMtpSupportsPythonTorchAndNativeAtbRegistration) {
+  for (const std::string backend : {"TORCH", "ATB", "AUTO"}) {
+    std::string effective_backend;
+    std::string resolved_name;
+    std::string error_message;
+
+    ASSERT_TRUE(resolve_model_registration("glm_moe_dsa_mtp",
+                                           backend,
+                                           &effective_backend,
+                                           &resolved_name,
+                                           &error_message))
+        << error_message;
+    EXPECT_EQ(resolved_name, "glm_moe_dsa_mtp");
+    EXPECT_EQ(effective_backend, backend == "AUTO" ? "ATB" : backend);
+    EXPECT_TRUE(error_message.empty());
+  }
+}
+
 }  // namespace
 }  // namespace xllm
