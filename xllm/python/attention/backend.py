@@ -233,6 +233,11 @@ class AttentionBackend(ABC):
     def page_size(self) -> int:
         pass
 
+    @property
+    def logical_page_size(self) -> int:
+        """Number of global KV tokens represented by one block-table entry."""
+        return self.page_size
+
     def execute_mla(
         self,
         q_latent: torch.Tensor,

@@ -92,6 +92,10 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         self._expanded_indexer_block_table: torch.Tensor | None = None
         self._sfa_metadata: AscendSFADCPMetadata | None = None
 
+    @property
+    def logical_page_size(self) -> int:
+        return self.page_size * self._dcp_group.size()
+
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         super().bind_kv_caches(kv_caches)
         self._kv_layout = KVShardLayout(
@@ -133,7 +137,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         self._sfa_metadata = None
         if self._kv_layout is None or self._builder is None:
             return
-        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.page_size)
+        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.logical_page_size)
         block_table = self._block_table_i32
         kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         if block_table is None:

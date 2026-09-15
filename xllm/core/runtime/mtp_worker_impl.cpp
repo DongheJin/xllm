@@ -1034,7 +1034,7 @@ int64_t MTPWorkerImpl::spec_verify_block_table_width(
     const int64_t declared_capacity =
         mtp_async::speculative_verify_block_table_capacity(
             impl_->context_.get_model_args().max_position_embeddings(),
-            options_.block_size());
+            logical_block_size());
     CHECK_LE(required_width, declared_capacity)
         << "block table width exceeds the model position capacity";
     required_width = declared_capacity;
@@ -1046,6 +1046,13 @@ bool MTPWorkerImpl::use_chunked_prefill_spec_verify_path() const {
   return target_spec_verify_mode_ ==
              mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
          supports_explicit_spec_verify_replay_update();
+}
+
+int32_t MTPWorkerImpl::logical_block_size() const {
+  CHECK_GT(options_.block_size(), 0);
+  const int32_t kv_split_size = parallel_args_.kv_split_size_effective();
+  CHECK_GT(kv_split_size, 0);
+  return options_.block_size() * kv_split_size;
 }
 
 bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
@@ -1602,7 +1609,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         target_base_kv_seq_lens,
         /*use_chunked_prefill=*/false,
         /*rebuild_expanded_decode_metadata=*/true,
-        options_.block_size());
+        logical_block_size());
   } else {
     // First decode after prefill and batch transitions use the host cache.
     std::vector<EmbeddingCache::DecodeState> last_states =
@@ -1745,7 +1752,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
             accepted_tokens,
             target_base_positions,
             target_base_kv_seq_lens,
-            options_.block_size());
+            logical_block_size());
         validate_input.retained_device_tensors = {
             accepted_tokens, target_base_positions, target_base_kv_seq_lens};
         finish_metadata_prepare(*prepare_stream_, validate_input);
@@ -1772,7 +1779,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                                       accepted_base_positions,
                                                       accepted_base_kv_seq_lens,
                                                       draft_idx + 1,
-                                                      options_.block_size());
+                                                      logical_block_size());
     } else {
       prepare_draft_inputs(metadata_template, next_step_input, draft_idx + 1);
     }
@@ -2826,7 +2833,7 @@ void MTPWorkerImpl::enqueue_next_first_draft(
       base_kv_seq_lens,
       /*use_chunked_prefill=*/false,
       /*rebuild_expanded_decode_metadata=*/false,
-      options_.block_size());
+      logical_block_size());
 
   submit_pending_first_draft(input, std::move(combined_input));
 }
@@ -2976,7 +2983,7 @@ void MTPWorkerImpl::update_decode_step_input(
       if (block_tables.defined() && block_tables.dim() == 2 &&
           seq_id < block_tables.size(0)) {
         const int32_t allocated_kv_len =
-            static_cast<int32_t>(block_tables.size(1)) * options_.block_size();
+            static_cast<int32_t>(block_tables.size(1)) * logical_block_size();
         const int32_t validate_width = options_.num_speculative_tokens() + 1;
         const int32_t max_valid_position = allocated_kv_len - validate_width;
         if (current_position > max_valid_position) {
@@ -3055,8 +3062,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   const int32_t num_sequences = input_params.meta.num_sequences;
   const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
   const int32_t total_num_val_tokens = num_sequences * num_val_tokens;
-  const int32_t logical_block_size =
-      options_.block_size() * parallel_args_.kv_split_size_effective();
+  const int32_t logical_block_size = this->logical_block_size();
   const bool positions_decoupled = positions_are_decoupled_from_kv_length();
 #if defined(USE_NPU)
   const bool use_explicit_spec_verify_replay_update =
@@ -3384,14 +3390,14 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
         input_params.graph.expanded_kv_seq_lens,
         input_params.graph.expanded_block_tables,
         input_params.graph.expanded_kv_seq_lens_vec,
-        options_.block_size());
+        logical_block_size);
     input_params.graph.input_tokens_override = validate_input.token_ids;
     input_params.graph.spec_verify_source_addresses_stable = true;
   } else {
     input_params.attention.rebuild_device_buffer(device_);
     if (supports_explicit_spec_verify_replay_update()) {
       build_expanded_spec_verify_graph_input(
-          input_params, device_, options_.block_size());
+          input_params, device_, logical_block_size);
     }
   }
 #else
@@ -3484,8 +3490,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
     max_val_tokens =
         std::max(max_val_tokens, per_seq_val_tokens[static_cast<size_t>(i)]);
   }
-  const int32_t logical_block_size =
-      options_.block_size() * parallel_args_.kv_split_size_effective();
+  const int32_t logical_block_size = this->logical_block_size();
   const bool positions_decoupled = positions_are_decoupled_from_kv_length();
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
@@ -3624,7 +3629,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
 #if defined(USE_NPU)
   if (supports_explicit_spec_verify_replay_update()) {
     build_expanded_spec_verify_graph_input(
-        input_params, device_, options_.block_size());
+        input_params, device_, logical_block_size);
   }
 #endif
   validate_input.device_tensors_ready = true;
@@ -3656,8 +3661,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
 
-  const int32_t logical_block_size =
-      options_.block_size() * parallel_args_.kv_split_size_effective();
+  const int32_t logical_block_size = this->logical_block_size();
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(base_input);
   torch::TensorOptions token_options = extend_input.token_ids.options();
@@ -3908,8 +3912,7 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
   auto& input_params = draft_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
   const int32_t num_sequences = input_params.meta.num_sequences;
-  const int32_t logical_block_size =
-      options_.block_size() * parallel_args_.kv_split_size_effective();
+  const int32_t logical_block_size = this->logical_block_size();
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
   specBuilder::DecodeBuildBuffers buf;

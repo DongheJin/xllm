@@ -101,7 +101,8 @@ def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes() -> None:
     assert torch.equal(expanded[0, :4], torch.tensor([4, 5, 6, 7], dtype=torch.int32))
 
 
-def test_prepare_uses_expanded_rows_for_mtp_verify() -> None:
+@pytest.mark.parametrize("first_kv_len", [3, 511])
+def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
     backend = SfaDcpAttentionBackend(
         num_heads=8,
         num_kv_heads=1,
@@ -139,20 +140,24 @@ def test_prepare_uses_expanded_rows_for_mtp_verify() -> None:
     metadata = SimpleNamespace(
         slot_mapping=torch.arange(4, dtype=torch.int32),
         block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
-        kv_seq_lens=torch.tensor([4, 8], dtype=torch.int32),
-        kv_seq_lens_host_values=[4, 8],
+        kv_seq_lens=torch.tensor([first_kv_len + 1, first_kv_len + 5], dtype=torch.int32),
+        kv_seq_lens_host_values=[first_kv_len + 1, first_kv_len + 5],
         q_cu_seq_lens=None,
         q_seq_lens=None,
         expanded_decode_metadata=SimpleNamespace(
             enabled=True,
-            kv_seq_lens=torch.tensor([3, 4, 7, 8], dtype=torch.int32),
+            kv_seq_lens=torch.tensor([first_kv_len + offset for offset in (0, 1, 4, 5)], dtype=torch.int32),
             block_table=torch.tensor([[10, 11], [10, 11], [20, 21], [20, 21]], dtype=torch.int32),
-            paged_kv_indptr=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
-            paged_kv_indices=torch.tensor([10, 10, 20, 21, 20, 21], dtype=torch.int32),
-            paged_kv_last_page_len=torch.tensor([3, 4, 3, 4], dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, 1, 2, 3, 4] if first_kv_len == 3 else [0, 1, 2, 4, 6], dtype=torch.int32),
+            paged_kv_indices=torch.tensor(
+                [10, 10, 20, 20] if first_kv_len == 3 else [10, 10, 20, 21, 20, 21], dtype=torch.int32
+            ),
+            paged_kv_last_page_len=torch.tensor(
+                [3, 4, 7, 8] if first_kv_len == 3 else [511, 512, 3, 4], dtype=torch.int32
+            ),
             paged_attention_tiling_data=None,
             kv_seq_lens_host=None,
-            kv_seq_lens_host_values=[3, 4, 7, 8],
+            kv_seq_lens_host_values=[first_kv_len + offset for offset in (0, 1, 4, 5)],
         ),
         is_prefill=False,
         is_chunked_prefill=False,
@@ -163,5 +168,6 @@ def test_prepare_uses_expanded_rows_for_mtp_verify() -> None:
 
     assert captured["num_reqs"] == 4
     assert captured["num_input_tokens"] == 4
-    assert captured["seq_lens"].tolist() == [3, 4, 7, 8]
+    assert captured["seq_lens"].tolist() == [first_kv_len + offset for offset in (0, 1, 4, 5)]
     assert captured["block_table"].shape == (4, 2)
+    assert backend._mla_max_seqlen_k == 1024

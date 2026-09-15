@@ -100,6 +100,50 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
 
 
+@pytest.mark.parametrize("expanded", [False, True])
+@pytest.mark.parametrize("decoding_tokens", [1, 2])
+def test_dcp_graph_metadata_uses_logical_pages(expanded: bool, decoding_tokens: int) -> None:
+    runner = _runner()
+    runner.attention_backend.logical_page_size = 8
+    runner.max_model_len = 16
+    runner.num_decoding_tokens = decoding_tokens
+    metadata = _metadata(torch.tensor([3, 7], dtype=torch.int32))
+    metadata.slot_mapping = torch.tensor([87, 88], dtype=torch.int32)
+    metadata.block_table = torch.tensor([[10, 11], [10, 11]], dtype=torch.int32)
+    metadata.kv_seq_lens = torch.tensor([8, 9], dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [8, 9]
+    # The unexpanded input still has sequence-scoped paged metadata. The
+    # runner must rebuild it for the two token rows using logical pages.
+    metadata.paged_kv_indptr = torch.tensor([0, 2], dtype=torch.int32)
+    metadata.paged_kv_indices = torch.tensor([10, 11], dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.tensor([1], dtype=torch.int32)
+    if expanded:
+        metadata.expanded_decode_metadata = SimpleNamespace(
+            enabled=True,
+            block_table=metadata.block_table,
+            kv_seq_lens=metadata.kv_seq_lens,
+            kv_seq_lens_host_values=[8, 9],
+            kv_seq_lens_host=None,
+            paged_kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+            paged_kv_indices=torch.tensor([10, 10, 11], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([8, 1], dtype=torch.int32),
+            paged_attention_tiling_data=None,
+        )
+
+    _, _, _, indptr, indices, last_page_lens = runner._decode_metadata(metadata)
+    assert indptr.tolist() == [0, 1, 3]
+    assert indices.tolist() == [10, 10, 11]
+    assert last_page_lens.tolist() == [8, 1]
+
+    entry = runner._allocate_entry(
+        padded_batch_size=2,
+        input_ids=torch.tensor([42, 43], dtype=torch.int32),
+        positions=torch.tensor([7, 8], dtype=torch.int32),
+        metadata=metadata,
+    )
+    assert entry.static_metadata.block_table.shape == (2, 3)
+
+
 def test_mtp_linear_state_indices_repeat_for_expanded_rows() -> None:
     runner = _runner()
     input_ids = torch.arange(4, dtype=torch.int32)

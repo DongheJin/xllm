@@ -227,6 +227,10 @@ class DecodeAclGraphRunner(BaseRunner):
             global_num_tokens // self.num_decoding_tokens,
         )
 
+    @property
+    def _logical_page_size(self) -> int:
+        return int(getattr(self.attention_backend, "logical_page_size", self.attention_backend.page_size))
+
     def _decode_metadata(
         self, metadata: AttentionMetadata
     ) -> tuple[
@@ -238,7 +242,7 @@ class DecodeAclGraphRunner(BaseRunner):
         torch.Tensor,
     ]:
         """Return per-row KV and paging metadata for decode graph replay."""
-        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
+        expanded = resolve_expanded_decode_metadata(metadata, block_size=self._logical_page_size)
         block_table = expanded.block_table if expanded is not None else metadata.block_table
         kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         if block_table is None or kv_seq_lens is None:
@@ -324,7 +328,7 @@ class DecodeAclGraphRunner(BaseRunner):
         kv_seq_lens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build token-row paging metadata like the C++ graph input builder."""
-        page_size = int(self.attention_backend.page_size)
+        page_size = self._logical_page_size
         if page_size <= 0:
             raise RuntimeError("decode graph page size must be positive")
 
@@ -654,8 +658,10 @@ class DecodeAclGraphRunner(BaseRunner):
             paged_kv_last_page_len,
         ) = self._decode_metadata(metadata)
         if self._paged_kv_indices_buffer is None:
-            page_size = self.attention_backend.page_size
-            max_blocks_per_sequence = (self.max_model_len + page_size - 1) // page_size
+            page_size = self._logical_page_size
+            # Reserve the scheduler's lookahead page, including for the MTP
+            # draft executor, which reports one decoding token per request.
+            max_blocks_per_sequence = (self.max_model_len + page_size - 1) // page_size + 1
             self._paged_kv_indices_buffer = torch.zeros(
                 self.max_batch * max_blocks_per_sequence,
                 dtype=paged_kv_indices.dtype,
